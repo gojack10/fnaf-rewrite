@@ -1,1 +1,6 @@
 reference/
+
+# Claude Code per-project memory (actual files live at ~/.claude/projects/...)
+.claude/
+memory/
+MEMORY.md
