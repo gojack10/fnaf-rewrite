@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_events import FrameEvents, decode_frame_events
 from fnaf_parser.decoders.frame_fade import FrameFade, decode_frame_fade
 from fnaf_parser.decoders.frame_item_instances import (
     FrameItemInstances,
@@ -146,6 +147,7 @@ class Frame:
     item_instances: FrameItemInstances | None
     fade_in: FrameFade | None
     fade_out: FrameFade | None
+    events: FrameEvents | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -177,6 +179,7 @@ class Frame:
             ),
             "fade_in": self.fade_in.as_dict() if self.fade_in is not None else None,
             "fade_out": self.fade_out.as_dict() if self.fade_out is not None else None,
+            "events": self.events.as_dict() if self.events is not None else None,
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -296,6 +299,7 @@ def decode_frame(
     item_instances: FrameItemInstances | None = None
     fade_in: FrameFade | None = None
     fade_out: FrameFade | None = None
+    events: FrameEvents | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -435,6 +439,20 @@ def decode_frame(
                     "state is inconsistent."
                 )
             fade_out = decode_frame_fade(rec.decoded_payload, unicode=unicode)
+        elif rec.id == SUB_FRAME_EVENTS:
+            # Runtime event graph - the wire-format envelope is decoded
+            # here; parameter-type decoding is deferred to probe #4.13+
+            # (this probe treats parameters as `(code, data)` opaque
+            # blobs). Same decoded_payload invariant as peer flag=3
+            # branches: the deferred guard above rules out flag=2/3
+            # without a transform, so non-None is guaranteed.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame Events (0x333D) sub-chunk had no decoded "
+                    "payload despite transform being supplied — decoder "
+                    "state is inconsistent."
+                )
+            events = decode_frame_events(rec.decoded_payload)
 
     return Frame(
         sub_records=sub_records,
@@ -447,5 +465,6 @@ def decode_frame(
         item_instances=item_instances,
         fade_in=fade_in,
         fade_out=fade_out,
+        events=events,
         deferred_encrypted=tuple(deferred),
     )
