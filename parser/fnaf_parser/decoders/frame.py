@@ -42,6 +42,10 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_item_instances import (
+    FrameItemInstances,
+    decode_frame_item_instances,
+)
 from fnaf_parser.decoders.frame_layer_effects import (
     FrameLayerEffects,
     decode_frame_layer_effects,
@@ -138,6 +142,7 @@ class Frame:
     virtual_rect: FrameVirtualRect | None
     layers: FrameLayers | None
     layer_effects: FrameLayerEffects | None
+    item_instances: FrameItemInstances | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -160,6 +165,11 @@ class Frame:
             "layer_effects": (
                 self.layer_effects.as_dict()
                 if self.layer_effects is not None
+                else None
+            ),
+            "item_instances": (
+                self.item_instances.as_dict()
+                if self.item_instances is not None
                 else None
             ),
             "sub_chunks": [
@@ -260,6 +270,7 @@ def decode_frame(
     - Frame VirtualRect (0x3342): 16-byte int32x4, flag 3 in FNAF 1.
     - Frame Layers (0x3341): variable-length layer list, flag 3 in FNAF 1.
     - Frame Layer Effects (0x3345): parallel array to Layers, flag 3 in FNAF 1.
+    - Frame Item Instances (0x3338): placed object instances, flag 3 in FNAF 1.
 
     When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
     decrypted during the walk. Their `decoded_payload` then holds the
@@ -275,6 +286,7 @@ def decode_frame(
     virtual_rect: FrameVirtualRect | None = None
     layers: FrameLayers | None = None
     layer_effects: FrameLayerEffects | None = None
+    item_instances: FrameItemInstances | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -360,6 +372,37 @@ def decode_frame(
             layer_effects = decode_frame_layer_effects(
                 rec.decoded_payload, num_layers=layers.count
             )
+        elif rec.id == SUB_FRAME_ITEM_INSTANCES:
+            # First frame sub-chunk carrying world state rather than
+            # configuration. Length-prefixed (u32 count + N * 20 B
+            # instance records). Same decoded_payload invariant as the
+            # peer flag=3 branches: the deferred guard above rules out
+            # flag=2/3 without a transform, so non-None is guaranteed.
+            # Cross-chunk antibody (#4): once FrameLayers is decoded,
+            # every instance's `layer` field must be `< layers.count`.
+            # We enforce that here when layers is available so the
+            # failure points at the offending instance instead of
+            # bubbling up as a downstream index error.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame Item Instances (0x3338) sub-chunk had no "
+                    "decoded payload despite transform being supplied "
+                    "— decoder state is inconsistent."
+                )
+            item_instances = decode_frame_item_instances(rec.decoded_payload)
+            if layers is not None:
+                for idx, inst in enumerate(item_instances.instances):
+                    if not (0 <= inst.layer < layers.count):
+                        raise FrameDecodeError(
+                            f"Frame Item Instances (0x3338): instance "
+                            f"#{idx} (handle={inst.handle}, "
+                            f"object_info={inst.object_info}) references "
+                            f"layer={inst.layer} which is out of range "
+                            f"[0, {layers.count}). Cross-chunk antibody "
+                            f"#4 (multi-oracle): either RC4 drift on "
+                            f"FrameLayers or FrameItemInstances, or a "
+                            f"real schema violation in the source pack."
+                        )
 
     return Frame(
         sub_records=sub_records,
@@ -369,5 +412,6 @@ def decode_frame(
         virtual_rect=virtual_rect,
         layers=layers,
         layer_effects=layer_effects,
+        item_instances=item_instances,
         deferred_encrypted=tuple(deferred),
     )
