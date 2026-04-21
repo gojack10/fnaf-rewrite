@@ -1,0 +1,14 @@
+[project]
+name = "fnaf-parser"
+version = "0.1.0"
+description = "FNAF 1 Clickteam data-pack parser"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pytest>=9.0.3",
+    "rich>=15.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
