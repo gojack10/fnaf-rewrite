@@ -60,8 +60,15 @@ from fnaf_parser.decoders.sounds import (
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import make_transform
 from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
+from tests.fnaf1_constants import FNAF1_BANK_OFFSET_DELTA
 
 FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
+
+# Alias for local readability — see `tests/fnaf1_constants.py`. Probe #9
+# confirmed the same +260 delta first observed in probe #7 (images) and
+# later in probe #10 (fonts). Kept as a named constant so a sound-bank
+# drift fires with a clearly-scoped failure.
+FNAF1_SOUND_OFFSET_DELTA = FNAF1_BANK_OFFSET_DELTA
 
 
 # --- Synthetic helpers --------------------------------------------------
@@ -628,9 +635,10 @@ def test_fnaf1_sound_bank_cross_chunk_handshake_with_delta():
         f"expected CTFAK2-style adjusted handle to win on FNAF 1, "
         f"got {winning_attr!r}"
     )
-    assert winning_delta == 260, (
-        f"expected same +260 offset delta as 0x5555 ImageOffsets "
-        f"(probe #7 FNAF1_IMAGE_OFFSET_DELTA), got {winning_delta}"
+    assert winning_delta == FNAF1_SOUND_OFFSET_DELTA, (
+        f"expected same +{FNAF1_SOUND_OFFSET_DELTA} offset delta as "
+        f"0x5555 ImageOffsets (probe #7 FNAF1_BANK_OFFSET_DELTA), "
+        f"got {winning_delta}"
     )
 
     # Per-record enforcement with the winning convention. Named loop so

@@ -53,15 +53,16 @@ from fnaf_parser.decoders.images import (
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import make_transform
 from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
+from tests.fnaf1_constants import FNAF1_BANK_OFFSET_DELTA
 
 FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
 
-# Empirical constant: on FNAF 1, every 0x5555 offset equals the
-# corresponding image's record_start_offset + 260. See
-# `test_fnaf1_image_bank_cross_chunk_handshake_with_delta` for the
-# investigation; 260 is pinned here as a named constant so a future
-# pack where the delta differs fires a clearly-named failure.
-FNAF1_IMAGE_OFFSET_DELTA = 260
+# Empirical pack-level delta — see `tests/fnaf1_constants.py`. Images
+# was the first probe to observe it (probe #7); sounds (probe #9) and
+# fonts (probe #10) subsequently confirmed the same +260 against their
+# own offset tables. A clearly-named failure surfaces if a future FNAF 1
+# rebuild changes the delta in any of the three banks.
+FNAF1_IMAGE_OFFSET_DELTA = FNAF1_BANK_OFFSET_DELTA
 
 
 # --- Synthetic helpers --------------------------------------------------

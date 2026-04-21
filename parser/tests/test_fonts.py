@@ -69,8 +69,14 @@ from fnaf_parser.decoders.fonts import (
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import make_transform
 from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
+from tests.fnaf1_constants import FNAF1_BANK_OFFSET_DELTA
 
 FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
+
+# Alias for local readability — see `tests/fnaf1_constants.py`. Probe
+# #10 confirmed the same +260 delta first seen in images (#7) and
+# sounds (#9). Three independent banks, one pack-level constant.
+FNAF1_FONT_OFFSET_DELTA = FNAF1_BANK_OFFSET_DELTA
 
 
 # --- Synthetic pack helpers ---------------------------------------------
@@ -552,12 +558,18 @@ def test_fnaf1_fonts_cross_chunk_offset_handshake():
     # the pack's handle convention flipped — re-investigate before
     # trusting `FONT_HANDLE_ADJUST`.
     #
-    # Placeholders — replaced after first run against FNAF 1. The
-    # winning attribute tells us which oracle was right for this pack:
-    # "raw_handle" → CTFAK2 (> 284, no adjust), "handle" → Anaconda
-    # (>= 284, apply -1).
-    assert winning_attr in ("raw_handle", "handle")
-    # The winning delta should be a small constant — compare against
-    # the +260 sound/image deltas. If it's +260 too, lift the shared
-    # constant in probe #10.1.
-    assert isinstance(winning_delta, int)
+    # Winning attribute identifies the oracle: "raw_handle" → CTFAK2
+    # (strict `> 284`, no adjust), "handle" → Anaconda (`>= 284`, apply
+    # -1). FNAF 1 empirically resolved as Anaconda's convention.
+    assert winning_attr == "handle", (
+        f"expected Anaconda-style adjusted handle (-1) to win on FNAF 1, "
+        f"got {winning_attr!r}"
+    )
+    # Third independent confirmation of the pack-level +260 delta —
+    # after probe #7 (images) and probe #9 (sounds). The shared
+    # `FNAF1_BANK_OFFSET_DELTA` now lives in `tests/fnaf1_constants.py`.
+    assert winning_delta == FNAF1_FONT_OFFSET_DELTA, (
+        f"expected same +{FNAF1_FONT_OFFSET_DELTA} offset delta as the "
+        f"image/sound banks (tests.fnaf1_constants.FNAF1_BANK_OFFSET_DELTA), "
+        f"got {winning_delta}"
+    )
