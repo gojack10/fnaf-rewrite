@@ -48,17 +48,71 @@ class ChunkPayloadError(ValueError):
     """
 
 
+def decompress_payload_bytes(raw: bytes, *, flags: int, chunk_id: int) -> bytes:
+    """Decode a raw TLV payload into its plaintext bytes.
+
+    Outer chunks and Frame-container sub-chunks share this same flag→mode
+    encoding (CTFAK Chunk.cs), so the decompression logic lives here — one
+    place to reason about size bookkeeping and zlib errors.
+
+    Supports flags 0 (NotCompressed) and 1 (Compressed). Flags 2 and 3
+    (Encrypted / CompressedAndEncrypted) require a keyed RC4-like transform
+    seeded off (editor, name, copyright) from the app-metadata chunks —
+    deferred to probe #4.5. Raises NotImplementedError with enough context
+    to identify the offending chunk.
+    """
+    try:
+        flag = ChunkFlag(flags)
+    except ValueError as exc:
+        raise ChunkPayloadError(
+            f"chunk 0x{chunk_id:04X} has unknown flags=0x{flags:04x} "
+            f"(expected 0..3)"
+        ) from exc
+
+    if flag is ChunkFlag.NOT_COMPRESSED:
+        return raw
+
+    if flag is ChunkFlag.COMPRESSED:
+        if len(raw) < _COMPRESSED_HEADER_SIZE:
+            raise ChunkPayloadError(
+                f"chunk 0x{chunk_id:04X} flagged Compressed but payload is "
+                f"only {len(raw)} bytes (need ≥{_COMPRESSED_HEADER_SIZE})"
+            )
+        decomp_size = int.from_bytes(raw[:4], "little")
+        comp_size = int.from_bytes(raw[4:8], "little")
+        stream = raw[_COMPRESSED_HEADER_SIZE:]
+        if comp_size != len(stream):
+            raise ChunkPayloadError(
+                f"chunk 0x{chunk_id:04X}: compSize={comp_size} header says "
+                f"but {len(stream)} bytes remain in payload"
+            )
+        try:
+            decompressed = zlib.decompress(stream)
+        except zlib.error as exc:
+            raise ChunkPayloadError(
+                f"chunk 0x{chunk_id:04X}: zlib decompress failed: {exc}"
+            ) from exc
+        if len(decompressed) != decomp_size:
+            raise ChunkPayloadError(
+                f"chunk 0x{chunk_id:04X}: decompSize={decomp_size} header "
+                f"but {len(decompressed)} actual bytes decoded"
+            )
+        return decompressed
+
+    raise NotImplementedError(
+        f"chunk 0x{chunk_id:04X} has flag={flag.name} (0x{flags:04x}). "
+        f"Encrypted chunk decoding is deferred to probe #4.5 (Clickteam "
+        f"RC4-like transform seeded from editor+name+copyright)."
+    )
+
+
 def read_chunk_payload(blob: bytes, record: ChunkRecord) -> bytes:
     """Return the *decoded* payload bytes for a chunk record.
 
-    Handles the four flag modes. Compressed payloads are zlib-decompressed
-    with a size cross-check (decompSize header vs actual output length) —
-    catches truncated/corrupt zlib streams before downstream decoders see
-    mismatched byte counts.
-
     `blob` is the full file contents; `record.offset` points at the TLV
     header, so the payload lives at `record.offset + 8` for `record.size`
-    bytes.
+    bytes. Delegates the flag-specific decoding to
+    `decompress_payload_bytes` so sub-chunk decoders share the same path.
     """
     from fnaf_parser.chunk_walker import CHUNK_HEADER_SIZE
 
@@ -70,51 +124,4 @@ def read_chunk_payload(blob: bytes, record: ChunkRecord) -> bytes:
             f"{record.size} but file ends at 0x{len(blob):x}"
         )
     raw = blob[payload_start:payload_end]
-
-    try:
-        flag = ChunkFlag(record.flags)
-    except ValueError as exc:
-        raise ChunkPayloadError(
-            f"chunk 0x{record.id:04X} at 0x{record.offset:x} has unknown "
-            f"flags=0x{record.flags:04x} (expected 0..3)"
-        ) from exc
-
-    if flag is ChunkFlag.NOT_COMPRESSED:
-        return raw
-
-    if flag is ChunkFlag.COMPRESSED:
-        if len(raw) < _COMPRESSED_HEADER_SIZE:
-            raise ChunkPayloadError(
-                f"chunk 0x{record.id:04X} at 0x{record.offset:x} flagged "
-                f"Compressed but payload is only {len(raw)} bytes "
-                f"(need ≥{_COMPRESSED_HEADER_SIZE})"
-            )
-        decomp_size = int.from_bytes(raw[:4], "little")
-        comp_size = int.from_bytes(raw[4:8], "little")
-        stream = raw[_COMPRESSED_HEADER_SIZE:]
-        if comp_size != len(stream):
-            raise ChunkPayloadError(
-                f"chunk 0x{record.id:04X}: compSize={comp_size} header says "
-                f"but {len(stream)} bytes remain in payload"
-            )
-        try:
-            decompressed = zlib.decompress(stream)
-        except zlib.error as exc:
-            raise ChunkPayloadError(
-                f"chunk 0x{record.id:04X} at 0x{record.offset:x}: "
-                f"zlib decompress failed: {exc}"
-            ) from exc
-        if len(decompressed) != decomp_size:
-            raise ChunkPayloadError(
-                f"chunk 0x{record.id:04X}: decompSize={decomp_size} header "
-                f"but {len(decompressed)} actual bytes decoded"
-            )
-        return decompressed
-
-    # Encrypted / CompressedAndEncrypted — not used by FNAF 1 pack. If this
-    # ever fires it's an interesting finding, not a bug in us.
-    raise NotImplementedError(
-        f"chunk 0x{record.id:04X} at 0x{record.offset:x} has flag={flag.name} "
-        f"(0x{record.flags:04x}). FNAF 1 was not expected to use encrypted "
-        f"chunks; decode paths for flags 2/3 are not implemented."
-    )
+    return decompress_payload_bytes(raw, flags=record.flags, chunk_id=record.id)
