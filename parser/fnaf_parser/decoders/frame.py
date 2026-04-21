@@ -43,6 +43,10 @@ from dataclasses import dataclass, field
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
 from fnaf_parser.decoders.frame_palette import FramePalette, decode_frame_palette
+from fnaf_parser.decoders.frame_virtual_rect import (
+    FrameVirtualRect,
+    decode_frame_virtual_rect,
+)
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import TransformState
 
@@ -126,6 +130,7 @@ class Frame:
     name: str | None
     mvt_timer_base: int | None
     palette: FramePalette | None
+    virtual_rect: FrameVirtualRect | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -139,6 +144,11 @@ class Frame:
             "name": self.name,
             "mvt_timer_base": self.mvt_timer_base,
             "palette": self.palette.as_dict() if self.palette is not None else None,
+            "virtual_rect": (
+                self.virtual_rect.as_dict()
+                if self.virtual_rect is not None
+                else None
+            ),
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -233,6 +243,8 @@ def decode_frame(
     sub-chunk we can at the current probe scope:
     - Frame Name (0x3335): string, flag 0 or 1 in FNAF 1.
     - Mvt Timer Base (0x3347): int32 LE, always flag 0 in FNAF 1.
+    - Frame Palette (0x3337): 1028-byte palette, flag 3 in FNAF 1.
+    - Frame VirtualRect (0x3342): 16-byte int32x4, flag 3 in FNAF 1.
 
     When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
     decrypted during the walk. Their `decoded_payload` then holds the
@@ -245,6 +257,7 @@ def decode_frame(
     name: str | None = None
     mvt_timer_base: int | None = None
     palette: FramePalette | None = None
+    virtual_rect: FrameVirtualRect | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -280,11 +293,23 @@ def decode_frame(
                     "inconsistent."
                 )
             palette = decode_frame_palette(rec.decoded_payload)
+        elif rec.id == SUB_FRAME_VIRTUAL_RECT:
+            # Same decoded_payload invariant as the palette branch: the
+            # deferred guard above rules out flag=2/3 without a
+            # transform, so a non-None payload is guaranteed here.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame VirtualRect (0x3342) sub-chunk had no decoded "
+                    "payload despite transform being supplied — decoder "
+                    "state is inconsistent."
+                )
+            virtual_rect = decode_frame_virtual_rect(rec.decoded_payload)
 
     return Frame(
         sub_records=sub_records,
         name=name,
         mvt_timer_base=mvt_timer_base,
         palette=palette,
+        virtual_rect=virtual_rect,
         deferred_encrypted=tuple(deferred),
     )
