@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_fade import FrameFade, decode_frame_fade
 from fnaf_parser.decoders.frame_item_instances import (
     FrameItemInstances,
     decode_frame_item_instances,
@@ -143,6 +144,8 @@ class Frame:
     layers: FrameLayers | None
     layer_effects: FrameLayerEffects | None
     item_instances: FrameItemInstances | None
+    fade_in: FrameFade | None
+    fade_out: FrameFade | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -172,6 +175,8 @@ class Frame:
                 if self.item_instances is not None
                 else None
             ),
+            "fade_in": self.fade_in.as_dict() if self.fade_in is not None else None,
+            "fade_out": self.fade_out.as_dict() if self.fade_out is not None else None,
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -271,6 +276,8 @@ def decode_frame(
     - Frame Layers (0x3341): variable-length layer list, flag 3 in FNAF 1.
     - Frame Layer Effects (0x3345): parallel array to Layers, flag 3 in FNAF 1.
     - Frame Item Instances (0x3338): placed object instances, flag 3 in FNAF 1.
+    - Frame FadeIn (0x333B) / FadeOut (0x333C): Transition records, flag 3
+      in FNAF 1, optional (only 15 of 17 frames ship at least one).
 
     When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
     decrypted during the walk. Their `decoded_payload` then holds the
@@ -287,6 +294,8 @@ def decode_frame(
     layers: FrameLayers | None = None
     layer_effects: FrameLayerEffects | None = None
     item_instances: FrameItemInstances | None = None
+    fade_in: FrameFade | None = None
+    fade_out: FrameFade | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -403,6 +412,29 @@ def decode_frame(
                             f"FrameLayers or FrameItemInstances, or a "
                             f"real schema violation in the source pack."
                         )
+        elif rec.id == SUB_FRAME_FADE_IN:
+            # Optional sub-chunk: only 15 of 17 FNAF 1 frames ship it.
+            # When present, decode through the shared FrameFade path
+            # (0x333B and 0x333C share the Transition shape). Same
+            # decoded_payload invariant as peer flag=3 branches.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame FadeIn (0x333B) sub-chunk had no decoded "
+                    "payload despite transform being supplied — decoder "
+                    "state is inconsistent."
+                )
+            fade_in = decode_frame_fade(rec.decoded_payload, unicode=unicode)
+        elif rec.id == SUB_FRAME_FADE_OUT:
+            # Optional sub-chunk, symmetric to FadeIn. Same shape, same
+            # decoder. `flags` in FNAF 1 is 1 here (Color bit set;
+            # fade-to-black).
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame FadeOut (0x333C) sub-chunk had no decoded "
+                    "payload despite transform being supplied — decoder "
+                    "state is inconsistent."
+                )
+            fade_out = decode_frame_fade(rec.decoded_payload, unicode=unicode)
 
     return Frame(
         sub_records=sub_records,
@@ -413,5 +445,7 @@ def decode_frame(
         layers=layers,
         layer_effects=layer_effects,
         item_instances=item_instances,
+        fade_in=fade_in,
+        fade_out=fade_out,
         deferred_encrypted=tuple(deferred),
     )
