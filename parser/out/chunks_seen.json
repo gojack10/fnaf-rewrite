@@ -1,0 +1,244 @@
+{
+  "pack": {
+    "start": "0x00101400",
+    "pamu_offset": "0x0023BB45",
+    "pack_header_present": true,
+    "pack_data_size": 1288037,
+    "magic": "PAMU",
+    "unicode": true,
+    "runtime_version": "0x0302",
+    "runtime_subversion": "0x0000",
+    "product_version": 3,
+    "product_build": 284
+  },
+  "walk": {
+    "total_records": 43,
+    "unique_chunk_ids": 27,
+    "total_payload_bytes": 229100902,
+    "end_offset": "0x0DCB8A13",
+    "file_size": "0x0DCB8A13",
+    "reached_last": true,
+    "trailing_bytes_after_last": 0,
+    "dual_confirmed_ids_seen": 24,
+    "ctfak_only_ids_seen": 1,
+    "empirical_ids_seen": 2
+  },
+  "chunks": [
+    {
+      "id": "0x3333",
+      "name": "Frame",
+      "confidence": "dual",
+      "count": 17,
+      "first_offset": "0x00244B00",
+      "total_bytes": 38886
+    },
+    {
+      "id": "0x2223",
+      "name": "Header",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BB55",
+      "total_bytes": 65
+    },
+    {
+      "id": "0x2224",
+      "name": "Name",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BBAA",
+      "total_bytes": 56
+    },
+    {
+      "id": "0x2225",
+      "name": "Author",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BBEA",
+      "total_bytes": 40
+    },
+    {
+      "id": "0x2226",
+      "name": "Menu",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023C03B",
+      "total_bytes": 309
+    },
+    {
+      "id": "0x2229",
+      "name": "Frame Items",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023C213",
+      "total_bytes": 34938
+    },
+    {
+      "id": "0x222B",
+      "name": "Frame Handles",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x00244AB5",
+      "total_bytes": 42
+    },
+    {
+      "id": "0x222C",
+      "name": "Extension Data",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023C178",
+      "total_bytes": 4
+    },
+    {
+      "id": "0x222E",
+      "name": "App Editor-Filename",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BCA0",
+      "total_bytes": 88
+    },
+    {
+      "id": "0x222F",
+      "name": "App Target-Filename",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BC1A",
+      "total_bytes": 126
+    },
+    {
+      "id": "0x2231",
+      "name": "Other Extensions",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023C1E4",
+      "total_bytes": 39
+    },
+    {
+      "id": "0x2234",
+      "name": "Extension List",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023C184",
+      "total_bytes": 88
+    },
+    {
+      "id": "0x2235",
+      "name": "Icon 16x16",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BD00",
+      "total_bytes": 754
+    },
+    {
+      "id": "0x2237",
+      "name": "Serial Number",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x00244A95",
+      "total_bytes": 24
+    },
+    {
+      "id": "0x2240",
+      "name": "Exe Only",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x00244AE7",
+      "total_bytes": 1
+    },
+    {
+      "id": "0x2242",
+      "name": "Protection",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0024E36E",
+      "total_bytes": 4
+    },
+    {
+      "id": "0x2245",
+      "name": "Extended Header",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0023BFFA",
+      "total_bytes": 26
+    },
+    {
+      "id": "0x2246",
+      "name": "Spacer",
+      "confidence": "ctfak-only",
+      "count": 1,
+      "first_offset": "0x0023BB9E",
+      "total_bytes": 4
+    },
+    {
+      "id": "0x224D",
+      "name": "Unknown App Chunk (0x224D)",
+      "confidence": "empirical",
+      "count": 1,
+      "first_offset": "0x00244AF0",
+      "total_bytes": 8
+    },
+    {
+      "id": "0x224F",
+      "name": "Unknown App Chunk (0x224F)",
+      "confidence": "empirical",
+      "count": 1,
+      "first_offset": "0x0023C01C",
+      "total_bytes": 23
+    },
+    {
+      "id": "0x5555",
+      "name": "Image Handles",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0909116E",
+      "total_bytes": 2077
+    },
+    {
+      "id": "0x5556",
+      "name": "Font Handles",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x09091B46",
+      "total_bytes": 37
+    },
+    {
+      "id": "0x5557",
+      "name": "Sound Handles",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0DCB8918",
+      "total_bytes": 235
+    },
+    {
+      "id": "0x6666",
+      "name": "Images",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0024E37A",
+      "total_bytes": 149171692
+    },
+    {
+      "id": "0x6667",
+      "name": "Fonts",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x09091993",
+      "total_bytes": 427
+    },
+    {
+      "id": "0x6668",
+      "name": "Sounds",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x09091B73",
+      "total_bytes": 79850909
+    },
+    {
+      "id": "0x7F7F",
+      "name": "Last Chunk",
+      "confidence": "dual",
+      "count": 1,
+      "first_offset": "0x0DCB8A0B",
+      "total_bytes": 0
+    }
+  ]
+}
