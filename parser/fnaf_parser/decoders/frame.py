@@ -42,6 +42,10 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_layer_effects import (
+    FrameLayerEffects,
+    decode_frame_layer_effects,
+)
 from fnaf_parser.decoders.frame_layers import FrameLayers, decode_frame_layers
 from fnaf_parser.decoders.frame_palette import FramePalette, decode_frame_palette
 from fnaf_parser.decoders.frame_virtual_rect import (
@@ -133,6 +137,7 @@ class Frame:
     palette: FramePalette | None
     virtual_rect: FrameVirtualRect | None
     layers: FrameLayers | None
+    layer_effects: FrameLayerEffects | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -152,6 +157,11 @@ class Frame:
                 else None
             ),
             "layers": self.layers.as_dict() if self.layers is not None else None,
+            "layer_effects": (
+                self.layer_effects.as_dict()
+                if self.layer_effects is not None
+                else None
+            ),
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -249,6 +259,7 @@ def decode_frame(
     - Frame Palette (0x3337): 1028-byte palette, flag 3 in FNAF 1.
     - Frame VirtualRect (0x3342): 16-byte int32x4, flag 3 in FNAF 1.
     - Frame Layers (0x3341): variable-length layer list, flag 3 in FNAF 1.
+    - Frame Layer Effects (0x3345): parallel array to Layers, flag 3 in FNAF 1.
 
     When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
     decrypted during the walk. Their `decoded_payload` then holds the
@@ -263,6 +274,7 @@ def decode_frame(
     palette: FramePalette | None = None
     virtual_rect: FrameVirtualRect | None = None
     layers: FrameLayers | None = None
+    layer_effects: FrameLayerEffects | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -322,6 +334,32 @@ def decode_frame(
                     "state is inconsistent."
                 )
             layers = decode_frame_layers(rec.decoded_payload, unicode=unicode)
+        elif rec.id == SUB_FRAME_LAYER_EFFECTS:
+            # Cross-chunk antibody (#4): FrameLayerEffects is a parallel
+            # array to FrameLayers with no self-describing count. We
+            # require FrameLayers to have been decoded first (natural
+            # pack order in FNAF 1: 0x3341 precedes 0x3345) and thread
+            # its count into decode_frame_layer_effects. Any RC4 drift
+            # on either sub-chunk breaks the byte-count reconcile there.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame Layer Effects (0x3345) sub-chunk had no "
+                    "decoded payload despite transform being supplied "
+                    "— decoder state is inconsistent."
+                )
+            if layers is None:
+                raise FrameDecodeError(
+                    "Frame Layer Effects (0x3345) encountered before "
+                    "Frame Layers (0x3341). LayerEffects is a parallel "
+                    "array to Layers with no self-describing count — "
+                    "Layers must be decoded first to supply num_layers. "
+                    "Either the frame omits 0x3341 (schema violation) "
+                    "or the sub-chunks are reordered vs. the FNAF 1 "
+                    "pack order this decoder was written against."
+                )
+            layer_effects = decode_frame_layer_effects(
+                rec.decoded_payload, num_layers=layers.count
+            )
 
     return Frame(
         sub_records=sub_records,
@@ -330,5 +368,6 @@ def decode_frame(
         palette=palette,
         virtual_rect=virtual_rect,
         layers=layers,
+        layer_effects=layer_effects,
         deferred_encrypted=tuple(deferred),
     )
