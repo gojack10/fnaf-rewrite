@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
 from fnaf_parser.decoders.strings import decode_string_chunk
+from fnaf_parser.encryption import TransformState
 
 # Sub-chunk IDs appearing inside a 0x3333 Frame container. Named here so
 # grep locates all the places that know about them; the canonical label
@@ -111,8 +112,14 @@ class Frame:
 
     Carries every sub-chunk record we saw (so the raw bytes are always
     recoverable) plus the decoded-payload shortcuts for the sub-chunks we
-    actually understand at probe #4.4 scope. `deferred_encrypted` is the
-    Antibody #6 loud-skip list: sub-chunks present-but-not-yet-decoded.
+    actually understand. When the caller supplies a `TransformState`
+    encrypted sub-chunks are decrypted in-place and land in
+    `sub_records[i].decoded_payload`; `deferred_encrypted` then lists only
+    the sub-chunks we had a TransformState for but whose decoded payload
+    the top-level `decode_frame` has not yet learned to parse.
+
+    Without a TransformState, `deferred_encrypted` is the Antibody #6
+    loud-skip list (sub-chunks present-but-not-yet-decrypted).
     """
     sub_records: tuple[FrameSubChunkRecord, ...]
     name: str | None
@@ -144,14 +151,18 @@ class Frame:
         }
 
 
-def walk_frame_payload(payload: bytes) -> tuple[FrameSubChunkRecord, ...]:
+def walk_frame_payload(
+    payload: bytes, *, transform: TransformState | None = None
+) -> tuple[FrameSubChunkRecord, ...]:
     """Walk the inner TLV stream of a Frame container's decompressed payload.
 
     Strict mode (Antibody #1): any sub-chunk id not in CHUNK_NAMES raises
     FrameDecodeError immediately. Terminates on 0x7F7F LAST or end-of-buffer.
     For flag 0/1 sub-chunks, also runs the decompression so the caller gets
-    plaintext bytes; flag 2/3 sub-chunks yield records with
-    `decoded_payload=None` (deferred, not skipped).
+    plaintext bytes. For flag 2/3 sub-chunks: when `transform` is supplied,
+    decrypt (and decompress for flag 3) via the shared compression layer;
+    when it is absent, leave `decoded_payload=None` so the caller can still
+    surface the sub-chunk as deferred (Antibody #6 loud-skip).
     """
     records: list[FrameSubChunkRecord] = []
     pos = 0
@@ -178,12 +189,14 @@ def walk_frame_payload(payload: bytes) -> tuple[FrameSubChunkRecord, ...]:
         raw = payload[raw_start:raw_end]
 
         decoded: bytes | None
-        if (sflags & ChunkFlag.ENCRYPTED) != 0:
-            # Encrypted (flag 2) or CompressedAndEncrypted (flag 3). Deferred
-            # to probe #4.5; leave bytes in `raw` for later re-processing.
+        if (sflags & ChunkFlag.ENCRYPTED) != 0 and transform is None:
+            # Deferred: caller did not hand us a TransformState. Keep raw
+            # so a later pass can re-process once the key is available.
             decoded = None
         else:
-            decoded = decompress_payload_bytes(raw, flags=sflags, chunk_id=sid)
+            decoded = decompress_payload_bytes(
+                raw, flags=sflags, chunk_id=sid, transform=transform
+            )
 
         records.append(
             FrameSubChunkRecord(
@@ -205,26 +218,33 @@ def walk_frame_payload(payload: bytes) -> tuple[FrameSubChunkRecord, ...]:
     return tuple(records)
 
 
-def decode_frame(payload: bytes, *, unicode: bool = True) -> Frame:
+def decode_frame(
+    payload: bytes,
+    *,
+    unicode: bool = True,
+    transform: TransformState | None = None,
+) -> Frame:
     """Decode a 0x3333 Frame container's decompressed payload.
 
     Walks the inner TLV stream (see walk_frame_payload) and extracts every
-    sub-chunk we can at probe #4.4 scope:
+    sub-chunk we can at the current probe scope:
     - Frame Name (0x3335): string, flag 0 or 1 in FNAF 1.
     - Mvt Timer Base (0x3347): int32 LE, always flag 0 in FNAF 1.
 
-    Encrypted sub-chunks are carried through as FrameSubChunkRecord with
-    decoded_payload=None and also listed separately in
-    `Frame.deferred_encrypted` for Antibody #6 visibility.
+    When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
+    decrypted during the walk. Their `decoded_payload` then holds the
+    plaintext bytes; `deferred_encrypted` lists only those we do not yet
+    know how to interpret at this probe scope. Without a transform, every
+    encrypted sub-chunk is surfaced in `deferred_encrypted` untouched.
     """
-    sub_records = walk_frame_payload(payload)
+    sub_records = walk_frame_payload(payload, transform=transform)
 
     name: str | None = None
     mvt_timer_base: int | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
-        if rec.is_encrypted:
+        if rec.is_encrypted and rec.decoded_payload is None:
             deferred.append(rec)
             continue
 
