@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_layers import FrameLayers, decode_frame_layers
 from fnaf_parser.decoders.frame_palette import FramePalette, decode_frame_palette
 from fnaf_parser.decoders.frame_virtual_rect import (
     FrameVirtualRect,
@@ -131,6 +132,7 @@ class Frame:
     mvt_timer_base: int | None
     palette: FramePalette | None
     virtual_rect: FrameVirtualRect | None
+    layers: FrameLayers | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -149,6 +151,7 @@ class Frame:
                 if self.virtual_rect is not None
                 else None
             ),
+            "layers": self.layers.as_dict() if self.layers is not None else None,
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -245,6 +248,7 @@ def decode_frame(
     - Mvt Timer Base (0x3347): int32 LE, always flag 0 in FNAF 1.
     - Frame Palette (0x3337): 1028-byte palette, flag 3 in FNAF 1.
     - Frame VirtualRect (0x3342): 16-byte int32x4, flag 3 in FNAF 1.
+    - Frame Layers (0x3341): variable-length layer list, flag 3 in FNAF 1.
 
     When `transform` is supplied, encrypted sub-chunks (flags 2/3) are
     decrypted during the walk. Their `decoded_payload` then holds the
@@ -258,6 +262,7 @@ def decode_frame(
     mvt_timer_base: int | None = None
     palette: FramePalette | None = None
     virtual_rect: FrameVirtualRect | None = None
+    layers: FrameLayers | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -304,6 +309,19 @@ def decode_frame(
                     "state is inconsistent."
                 )
             virtual_rect = decode_frame_virtual_rect(rec.decoded_payload)
+        elif rec.id == SUB_FRAME_LAYERS:
+            # Same decoded_payload invariant as the palette / virtual-rect
+            # branches: the deferred guard above rules out flag=2/3
+            # without a transform, so a non-None payload is guaranteed
+            # here. `unicode` is threaded through for the layer-name
+            # string decode (cross-channel antibody #4 with AppHeader).
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame Layers (0x3341) sub-chunk had no decoded "
+                    "payload despite transform being supplied — decoder "
+                    "state is inconsistent."
+                )
+            layers = decode_frame_layers(rec.decoded_payload, unicode=unicode)
 
     return Frame(
         sub_records=sub_records,
@@ -311,5 +329,6 @@ def decode_frame(
         mvt_timer_base=mvt_timer_base,
         palette=palette,
         virtual_rect=virtual_rect,
+        layers=layers,
         deferred_encrypted=tuple(deferred),
     )
