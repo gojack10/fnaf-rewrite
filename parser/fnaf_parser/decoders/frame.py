@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.frame_palette import FramePalette, decode_frame_palette
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import TransformState
 
@@ -124,6 +125,7 @@ class Frame:
     sub_records: tuple[FrameSubChunkRecord, ...]
     name: str | None
     mvt_timer_base: int | None
+    palette: FramePalette | None
     deferred_encrypted: tuple[FrameSubChunkRecord, ...]
 
     def sub_by_id(self, chunk_id: int) -> FrameSubChunkRecord | None:
@@ -136,6 +138,7 @@ class Frame:
         return {
             "name": self.name,
             "mvt_timer_base": self.mvt_timer_base,
+            "palette": self.palette.as_dict() if self.palette is not None else None,
             "sub_chunks": [
                 {
                     "id": f"0x{r.id:04X}",
@@ -241,6 +244,7 @@ def decode_frame(
 
     name: str | None = None
     mvt_timer_base: int | None = None
+    palette: FramePalette | None = None
     deferred: list[FrameSubChunkRecord] = []
 
     for rec in sub_records:
@@ -264,10 +268,23 @@ def decode_frame(
                     f"{len(body)} at frame-offset 0x{rec.inner_offset:x}"
                 )
             mvt_timer_base = int.from_bytes(body, "little", signed=True)
+        elif rec.id == SUB_FRAME_PALETTE:
+            # decoded_payload is guaranteed non-None here: either the
+            # sub-chunk was flag=0/1 and decompress_payload_bytes ran,
+            # or it was flag=2/3 and we only fall through the deferred
+            # branch above when transform is None.
+            if rec.decoded_payload is None:
+                raise FrameDecodeError(
+                    "Frame Palette (0x3337) sub-chunk had no decoded payload "
+                    "despite transform being supplied — decoder state is "
+                    "inconsistent."
+                )
+            palette = decode_frame_palette(rec.decoded_payload)
 
     return Frame(
         sub_records=sub_records,
         name=name,
         mvt_timer_base=mvt_timer_base,
+        palette=palette,
         deferred_encrypted=tuple(deferred),
     )
