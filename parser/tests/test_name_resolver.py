@@ -122,15 +122,34 @@ def test_resolve_condition_unknown_object_type_raises():
         resolve_condition(cond, path="grp[0]/cond[0]")
 
 
-def test_resolve_condition_unknown_system_slot_raises():
-    """Valid object_type in OBJECT_TYPE_NAMES but not in
-    CONDITION_SYSTEM_NAMES — the failure path is tested separately from
-    the "unknown num" path."""
-    cond = {"object_type": 1, "num": -1, "parameters": []}  # Backdrop
+def test_resolve_condition_unknown_num_falls_through_both_tables():
+    """Anaconda `common.pyx:138-142` `getName()` contract:
+    `systemDict[objectType]` first, else flat `extensionDict`. A num
+    missing from *both* raises, and the message cites both lookup paths
+    so triage can tell whether the gap is in the nested dict or the flat
+    table.
+    """
+    # Backdrop (object_type=1) has no CONDITION_SYSTEM_NAMES entry;
+    # num=-9999 is absent from CONDITION_EXTENSION_NAMES too.
+    cond = {"object_type": 1, "num": -9999, "parameters": []}
     with pytest.raises(
-        NameResolutionError, match="Unknown condition system-slot"
+        NameResolutionError,
+        match=r"Unknown condition num=-9999.*not in systemDict.*not in extensionDict",
     ):
         resolve_condition(cond, path="grp[0]/cond[0]")
+
+
+def test_resolve_condition_system_to_extension_fallback():
+    """Built-in visual object types inherit common-object conditions
+    (AnimationFrame, IsOverlapping, …) via the `extensionDict` fallback.
+    Mirrors Anaconda's `getName()` — see common.pyx:138-142.
+    """
+    # Backdrop has no CONDITION_SYSTEM_NAMES entry, so num=-1 must fall
+    # through to CONDITION_EXTENSION_NAMES[-1] = "AnimationFrame".
+    cond = {"object_type": 1, "num": -1, "parameters": []}
+    out = resolve_condition(cond)
+    assert out["object_type_name"] == "Backdrop"
+    assert out["num_name"] == "AnimationFrame"
 
 
 def test_resolve_condition_unknown_num_raises():
@@ -170,12 +189,30 @@ def test_resolve_action_extension_object_type():
     assert out["num_name"] == "Destroy"
 
 
-def test_resolve_action_unknown_extension_num_raises():
+def test_resolve_action_extension_native_num_stamps_ext_marker():
+    """Extension-native action nums (not in the flat ACTION_EXTENSION_NAMES)
+    belong to per-extension DLLs whose name tables we can't reach from
+    Linux. Anaconda's `getName()` returns `None` for these; we stamp an
+    explicit `ExtAction_<num>` marker so the name field is never None
+    and extension-native slots are greppable downstream.
+    """
     act = {"object_type": 45, "num": 9999, "parameters": []}
-    with pytest.raises(
-        NameResolutionError, match="Unknown action num=9999 for extension"
-    ):
-        resolve_action(act)
+    out = resolve_action(act)
+    assert out["object_type_name"] == "Extension"
+    assert out["num_name"] == "ExtAction_9999"
+
+
+def test_resolve_action_system_to_extension_fallback():
+    """Active (object_type=2) only has nums 80-89 in its nested
+    ACTION_SYSTEM_NAMES dict; nums below 80 inherit the common-object
+    actions (SetAlphaCoefficient=65, Destroy=24, …). This fallback is
+    load-bearing — Anaconda `common.pyx:138-142` pins it as part of the
+    shared `getName()` contract.
+    """
+    act = {"object_type": 2, "num": 65, "parameters": []}
+    out = resolve_action(act)
+    assert out["object_type_name"] == "Active"
+    assert out["num_name"] == "SetAlphaCoefficient"
 
 
 # --- resolve_expression ------------------------------------------------
@@ -237,12 +274,14 @@ def test_resolve_expression_unknown_object_type_raises():
         resolve_expression(expr)
 
 
-def test_resolve_expression_unknown_extension_num_raises():
+def test_resolve_expression_extension_native_num_stamps_ext_marker():
+    """Extension-native expression nums (not in EXPRESSION_EXTENSION_NAMES)
+    belong to per-extension DLLs. Same Ext<Kind>_<num> marker contract as
+    actions/conditions: never None, always greppable."""
     expr = {"object_type": EXTENSION_BASE + 10, "num": 99999}
-    with pytest.raises(
-        NameResolutionError, match="Unknown expression num=99999 for extension"
-    ):
-        resolve_expression(expr)
+    out = resolve_expression(expr)
+    assert out["object_type_name"] == "Extension"
+    assert out["num_name"] == "ExtExpression_99999"
 
 
 def test_resolve_expression_is_pure():
@@ -395,14 +434,21 @@ def test_resolve_parameter_expression_parameter_recurses():
 
 def test_resolve_parameter_expression_parameter_error_path_points_to_expr():
     """An unknown-ID inside an ExpressionParameter must cite its
-    `.../expr[N]` index for triage."""
+    `.../expr[N]` index for triage.
+
+    Uses `object_type=25` — a slot in the 10..31 non-extension gap that's
+    neither in OBJECT_TYPE_NAMES nor >= EXTENSION_BASE, so the object-type
+    resolver raises first. Extension territory (>= 32) intentionally
+    never raises on unknown nums (it stamps ExtExpression_<num>), so the
+    error-path test has to use a non-extension unknown.
+    """
     param = {
         "code": 22,
         "kind": "ExpressionParameter",
         "comparison": 0,
         "expressions": [
             {"object_type": -1, "num": 0},
-            {"object_type": 999, "num": 0},  # unknown
+            {"object_type": 25, "num": 0},  # unknown non-extension slot
         ],
         "trailing_hex": "",
     }
@@ -511,7 +557,12 @@ def test_resolve_frame_events_end_to_end():
 
 
 def test_resolve_frame_events_error_path_fully_qualified():
-    """Errors deep inside a FrameEvents walk name their full chain."""
+    """Errors deep inside a FrameEvents walk name their full chain.
+
+    object_type=25 lives in the non-extension gap (not in OBJECT_TYPE_NAMES
+    and not >= EXTENSION_BASE) so the leaf resolver raises with the full
+    path propagated back through every walker frame.
+    """
     fe = {
         "event_groups": [
             {
@@ -525,7 +576,7 @@ def test_resolve_frame_events_error_path_fully_qualified():
                                 "kind": "ExpressionParameter",
                                 "comparison": 0,
                                 "expressions": [
-                                    {"object_type": 999, "num": 0},
+                                    {"object_type": 25, "num": 0},
                                 ],
                                 "trailing_hex": "",
                             },

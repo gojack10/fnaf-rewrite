@@ -101,27 +101,43 @@ def _resolve_code(
     kind: str,
     path: str,
 ) -> str:
-    """Generic nested-vs-flat lookup for conditions / actions."""
+    """Generic nested-vs-flat lookup for conditions / actions.
+
+    Ports Anaconda's `getName()` contract (common.pyx:138-142):
+
+        if objectType in systemDict and num in systemDict[objectType]:
+            return systemDict[objectType][num]
+        elif num in extensionDict:
+            return extensionDict[num]
+
+    The fallback from `systemDict[objectType]` to the flat `extensionDict`
+    is load-bearing: built-in visual object types (Active=2, String=3,
+    Counter=7, etc.) inherit the *common-object* action/condition tables
+    (SetPosition, Stop, SetAlterableValue, SetAlphaCoefficient, …) for
+    nums below 80, and only override high-numbered slots in their own
+    nested dict. This is how Clickteam encodes action inheritance; the
+    resolver has to mirror it or every common-action call against a
+    visual object raises.
+    """
     if object_type >= EXTENSION_BASE:
-        if num not in extension_table:
-            raise NameResolutionError(
-                f"Unknown {kind} num={num} for extension object_type="
-                f"{object_type} at {path}"
-            )
+        if num in extension_table:
+            return extension_table[num]
+        # Extension-native num (per-extension DLL owns the real name).
+        # Anaconda's `getName` returns None here; we stamp an explicit
+        # `Ext<Kind>_<num>` marker so the name field is never None and
+        # consumers can grep extension-native slots unambiguously.
+        return f"Ext{kind.capitalize()}_{num}"
+    system_dict = system_table.get(object_type)
+    if system_dict is not None and num in system_dict:
+        return system_dict[num]
+    if num in extension_table:
         return extension_table[num]
-    if object_type not in system_table:
-        raise NameResolutionError(
-            f"Unknown {kind} system-slot object_type={object_type} "
-            f"(num={num}) at {path}"
-        )
-    table = system_table[object_type]
-    if num not in table:
-        object_type_name = OBJECT_TYPE_NAMES.get(object_type, "?")
-        raise NameResolutionError(
-            f"Unknown {kind} num={num} for object_type={object_type} "
-            f"({object_type_name}) at {path}"
-        )
-    return table[num]
+    object_type_name = OBJECT_TYPE_NAMES.get(object_type, "?")
+    raise NameResolutionError(
+        f"Unknown {kind} num={num} for object_type={object_type} "
+        f"({object_type_name}) at {path} — not in systemDict["
+        f"{object_type}] and not in extensionDict"
+    )
 
 
 def _resolve_expression_name(
@@ -129,32 +145,34 @@ def _resolve_expression_name(
 ) -> str:
     """Expression `(object_type, num)` → name.
 
-    Special cases:
+    Same system→extension fallback contract as `_resolve_code` (ported
+    from Anaconda `common.pyx:138-142`):
+
       * `(0, 0)` is the END marker and resolves via the operator slot.
       * `object_type == 0` is the operator slot (Plus/Minus/...).
       * `object_type >= EXTENSION_BASE` falls through to the flat
         extension table.
+      * For any other system object type: try `EXPRESSION_SYSTEM_NAMES`
+        first, then `EXPRESSION_EXTENSION_NAMES`, only raise when both
+        miss.
     """
     if object_type >= EXTENSION_BASE:
-        if num not in EXPRESSION_EXTENSION_NAMES:
-            raise NameResolutionError(
-                f"Unknown expression num={num} for extension "
-                f"object_type={object_type} at {path}"
-            )
+        if num in EXPRESSION_EXTENSION_NAMES:
+            return EXPRESSION_EXTENSION_NAMES[num]
+        # Extension-native expression slot (per-extension DLL).
+        return f"ExtExpression_{num}"
+    system_dict = EXPRESSION_SYSTEM_NAMES.get(object_type)
+    if system_dict is not None and num in system_dict:
+        return system_dict[num]
+    if num in EXPRESSION_EXTENSION_NAMES:
         return EXPRESSION_EXTENSION_NAMES[num]
-    if object_type not in EXPRESSION_SYSTEM_NAMES:
-        raise NameResolutionError(
-            f"Unknown expression system-slot object_type={object_type} "
-            f"(num={num}) at {path}"
-        )
-    table = EXPRESSION_SYSTEM_NAMES[object_type]
-    if num not in table:
-        object_type_name = OBJECT_TYPE_NAMES.get(object_type, "?")
-        raise NameResolutionError(
-            f"Unknown expression num={num} for object_type={object_type} "
-            f"({object_type_name}) at {path}"
-        )
-    return table[num]
+    object_type_name = OBJECT_TYPE_NAMES.get(object_type, "?")
+    raise NameResolutionError(
+        f"Unknown expression num={num} for object_type={object_type} "
+        f"({object_type_name}) at {path} — not in "
+        f"EXPRESSION_SYSTEM_NAMES[{object_type}] and not in "
+        f"EXPRESSION_EXTENSION_NAMES"
+    )
 
 
 def _resolve_operator(comparison: int, *, path: str) -> str:
