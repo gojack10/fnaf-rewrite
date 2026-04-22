@@ -23,9 +23,13 @@ CLI Scaffolding replaces that with a proper argparse tree:
         stays specific to test runs and doesn't double-gate the CLI.
 
     fnaf-parser dump-algorithm <exe> --out <dir>
-        Algorithm-extraction entry point; currently a stub that
-        surfaces the Output Emission work unit's status. Lands fully
-        when Output Emission ships.
+        Algorithm-extraction entry point. Decodes every parameter of
+        every condition/action across all 17 frames, resolves every
+        numeric ID to a name, and emits a 4-artefact pack:
+        `frames/frame_NN_<slug>.json` (per-frame pretty JSON) +
+        `combined.json` (merged) + `combined.jsonl` (one condition or
+        action per line) + `manifest.json` (navigation index with
+        SHA-256 hashes).
 
 Env-var compatibility
 ---------------------
@@ -223,22 +227,16 @@ def cmd_dump_assets(args: argparse.Namespace) -> int:
 
 
 def cmd_dump_algorithm(args: argparse.Namespace) -> int:
-    """`fnaf-parser dump-algorithm <exe> --out <dir>` — STUB.
+    """`fnaf-parser dump-algorithm <exe> --out <dir>` — full pipeline.
 
-    Delegates to `fnaf_parser.algorithm.emit.dump_algorithm`, which is
-    currently a stub that raises `NotImplementedError`. Output
-    Emission replaces the stub with the real pipeline. We catch the
-    NotImplementedError here so the CLI surfaces a clean message
-    instead of a traceback — users running against this stub need
-    actionable feedback, not a stack dump.
+    Delegates to `fnaf_parser.algorithm.emit.dump_algorithm`, which
+    walks every frame's event groups, decodes all 15 FNAF 1 parameter
+    codes (including recursive Expression ASTs), resolves every
+    numeric ID via Name Resolver, and emits the 4-artefact pack
+    described in the module docstring.
     """
     console = Console()
-    try:
-        written = dump_algorithm(args.exe, args.out)
-    except NotImplementedError as exc:
-        console.print(f"[red]dump-algorithm: not yet implemented.[/red] {exc}")
-        return 1
-
+    written = dump_algorithm(args.exe, args.out)
     console.print(f"[green]wrote[/green] {len(written)} file(s) -> {args.out}")
     return 0
 
@@ -295,11 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     # dump-algorithm
     alg_p = subparsers.add_parser(
         "dump-algorithm",
-        help="Emit the algorithm JSON + JSONL spec (stub until Output Emission).",
+        help="Emit the algorithm JSON + JSONL spec for every frame.",
         description=(
-            "Algorithm-extraction dump: per-frame JSON + combined.json + "
-            "combined.jsonl + manifest.json. Currently a stub that will "
-            "ship fully when the Output Emission work unit lands."
+            "Algorithm-extraction dump: per-frame JSON (frames/) + "
+            "combined.json + combined.jsonl + manifest.json. Every "
+            "parameter is decoded, every numeric ID is resolved to a "
+            "name, and Expression ASTs are rendered both structurally "
+            "(`ast`) and as flat pseudo-code (`expr_str`)."
         ),
     )
     alg_p.add_argument("exe", type=Path, help="Path to the Clickteam .exe")
