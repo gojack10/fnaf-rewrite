@@ -1,28 +1,29 @@
-"""Regression tests for 0x6666 pixel-payload decoder (probe #7.1a).
+"""Regression tests for 0x6666 pixel-payload decoder (probes #7.1a + #7.1b).
 
-Scope: the `graphic_mode == 4, flags == 0` path — 520 of FNAF 1's 605
-image records. Every other mode/flag combination is expected to raise,
-so flag=16 (85 records) staying as a deferred-work signal until probe
-#7.1b lands is enforced here.
+Scope: both `graphic_mode == 4` paths in FNAF 1 — `flags == 0` (520
+records, probe #7.1a) and `flags == 0x10` (85 records, probe #7.1b).
+Every other mode/flag combination is expected to raise.
 
 Antibody coverage:
 
-- #1 strict-unknown : mode != 4, flags != 0, truncated image_data,
-  non-positive width/height — all raise `ImagePixelsDecodeError`.
-- #2 byte-count    : output is always exactly `w * h * 4` bytes; row
-  padding (3 bytes on odd-width rows, 0 on even) is consumed from the
-  input and not emitted to the output.
-- #3 round-trip    : synthetic 2×2 and 3×2 streams decode to exactly
-  the expected RGBA byte sequences including the odd-width pad.
-- #5 multi-input   : all 520 FNAF 1 flag=0 records decode cleanly,
-  every output is `w * h * 4` bytes long.
-- #7 snapshot      : pins total decoded bytes (sum of w*h*4 across
-  flag=0 records) and a SHA-256 fingerprint computed over the
-  per-record pairs `(handle, sha256(rgba))`. Any single-pixel drift
-  on any record flips the fingerprint and names the handle.
-- Deferred-work  : every flag=16 record raises; pinned as 85 raises
-  so a future pack that silently reclassifies a flag=0 record trips
-  the count mismatch.
+- #1 strict-unknown : mode != 4, flag ∉ {0, 0x10}, truncated image_data
+  on either flag path, non-positive width/height — all raise
+  `ImagePixelsDecodeError`.
+- #2 byte-count    : output is always exactly `w * h * 4` bytes.
+  Flag=0 row pad is 0/3 bytes; flag=16 colour pad is 0/3 bytes AND the
+  alpha plane adds an independent 4-byte-aligned row pad that
+  exercises every width-mod-4 class.
+- #3 round-trip    : synthetic 2×2 and 3×2 streams decode for both
+  flag paths to exactly the expected RGBA sequences, including
+  odd-width colour pad AND the distinct 4-byte alpha-plane pad.
+- #5 multi-input   : all 520 flag=0 records AND all 85 flag=16
+  records in FNAF 1 decode cleanly, every output is `w * h * 4` bytes.
+- #7 snapshot      : per-flag SHA-256 fingerprint pins the entire
+  decoded bank; any single-pixel drift on any record flips the hash.
+- Alpha-distribution: flag=16 alpha channel across the whole bank is
+  non-degenerate (at least two distinct values, AND at least one
+  value that isn't 0 or 255) — catches an "alpha plane never read"
+  regression that round-trip hashes would also catch but less legibly.
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ from fnaf_parser.decoders.images_pixels import (
     DecodedPixels,
     ImagePixelsDecodeError,
     decode_flag0_bgr_masked,
+    decode_flag16_bgr_with_alpha_plane,
     decode_image_pixels,
+    get_alpha_row_padding_bytes,
     get_row_padding_bytes,
 )
 from fnaf_parser.decoders.strings import decode_string_chunk
@@ -72,6 +75,36 @@ def test_row_padding_rejects_non_positive():
     for w in (0, -1, -7):
         with pytest.raises(ImagePixelsDecodeError):
             get_row_padding_bytes(w)
+
+
+# --- Alpha-plane row padding (flag=0x10) --------------------------------
+
+
+def test_alpha_row_padding_matches_four_byte_alignment():
+    """Antibody #2: `(4 - width%4) % 4`. Spot-check every residue class
+    plus a few real-world widths from FNAF 1 sprite sheets."""
+    expected = {
+        1: 3, 2: 2, 3: 1, 4: 0,
+        5: 3, 6: 2, 7: 1, 8: 0,
+        100: 0,   # 100 % 4 == 0
+        101: 3,   # 101 % 4 == 1
+        102: 2,
+        103: 1,
+        320: 0, 321: 3,
+        1279: 1, 1280: 0,
+    }
+    for w, expected_pad in expected.items():
+        assert get_alpha_row_padding_bytes(w) == expected_pad, (
+            f"width={w}: expected alpha pad {expected_pad}, "
+            f"got {get_alpha_row_padding_bytes(w)}"
+        )
+
+
+def test_alpha_row_padding_rejects_non_positive():
+    """Same strict-unknown handling as the colour-plane helper."""
+    for w in (0, -1, -7):
+        with pytest.raises(ImagePixelsDecodeError):
+            get_alpha_row_padding_bytes(w)
 
 
 # --- Synthetic pixel decode (no binary needed) --------------------------
@@ -166,6 +199,123 @@ def test_decode_non_positive_dimensions_raise():
             decode_flag0_bgr_masked(b"", width=w, height=h, transparent=(0, 0, 0, 0))
 
 
+# --- Synthetic flag=16 decode (alpha plane) -----------------------------
+
+
+def test_decode_flag16_2x2_applies_alpha_plane_not_transparent_keying():
+    """Antibody #3 round-trip: a 2×2 flag=16 stream applies the alpha
+    plane to the A channel of every pixel and *never* consults a
+    transparent colour. Width 2 → colour pad 0 (even width) but
+    alpha pad 2 (2 % 4 = 2 → pad = 2), so every alpha row is
+    `[a0, a1, pad, pad]`. This test specifically exercises that the
+    alpha pad is NOT zero for even widths — a common miscount
+    collapses it to the colour pad."""
+    # Colour plane: every pixel (B=1, G=2, R=3). Width even → no colour pad.
+    colour = bytes([1, 2, 3,  1, 2, 3,  1, 2, 3,  1, 2, 3])
+    # Alpha plane: rows of [a0, a1, pad, pad]. Sentinel 0xAA in pad so
+    # any pad miscount bleeds into visible alpha and the assert fires.
+    alpha = bytes([0, 64, 0xAA, 0xAA,   128, 255, 0xAA, 0xAA])
+    rgba = decode_flag16_bgr_with_alpha_plane(
+        colour + alpha, width=2, height=2
+    )
+    # All pixels share RGB=(3, 2, 1); alpha comes strictly from the
+    # non-pad positions of the alpha plane.
+    assert list(rgba) == [
+        3, 2, 1, 0,    3, 2, 1, 64,
+        3, 2, 1, 128,  3, 2, 1, 255,
+    ]
+    # Explicit sanity: 0xAA is sentinel for "alpha pad bled through".
+    assert 0xAA not in rgba
+
+
+def test_decode_flag16_3x2_consumes_both_row_paddings():
+    """Antibody #2 byte-count: a 3×2 flag=16 stream has *two* kinds of
+    row pad — 3 bytes after each colour row (odd width @ 24bpp) and 1
+    byte after each alpha row (3 % 4 = 3 → pad = 1). If either pad is
+    miscounted the decoder reads alpha bytes from inside the colour
+    pad (or vice versa) and the output diverges.
+
+    Sentinel bytes 0xCC in both pad slots would bleed into output if
+    the row-advance logic is off by one."""
+    # Colour plane rows: 3 pixels × 3 bytes + 3 bytes pad each.
+    c_row0 = bytes([1, 2, 3,  4, 5, 6,  7, 8, 9,  0xCC, 0xCC, 0xCC])
+    c_row1 = bytes([
+        10, 20, 30,  40, 50, 60,  70, 80, 90,  0xCC, 0xCC, 0xCC,
+    ])
+    # Alpha plane rows: 3 alpha bytes + 1 byte pad each.
+    a_row0 = bytes([11, 22, 33,  0xCC])
+    a_row1 = bytes([44, 55, 66,  0xCC])
+    src = c_row0 + c_row1 + a_row0 + a_row1
+    rgba = decode_flag16_bgr_with_alpha_plane(src, width=3, height=2)
+    assert len(rgba) == 3 * 2 * 4
+    # Output must never contain 0xCC — if any pad is unread, the
+    # sentinel bleeds into a pixel channel.
+    assert 0xCC not in rgba
+    assert list(rgba[:12]) == [3, 2, 1, 11,  6, 5, 4, 22,  9, 8, 7, 33]
+    assert list(rgba[12:24]) == [
+        30, 20, 10, 44,  60, 50, 40, 55,  90, 80, 70, 66,
+    ]
+
+
+def test_decode_flag16_ignores_transparent_colour_semantics():
+    """Explicit antibody: flag=16 decoder has no `transparent` param
+    and never consults one. A pixel whose BGR would match a
+    "would-be transparent" sentinel gets its alpha from the alpha
+    plane only — not forced to 0. Closes the inherited §10.3 open
+    question from Probe #7.1a."""
+    # Pixel at (0,0) has RGB=(3,2,1) — exactly what flag=0's
+    # transparent test used to key off.
+    colour = bytes([1, 2, 3,  10, 20, 30])
+    # Alpha row = [a0, a1, pad, pad] (width=2 → pad=2).
+    alpha = bytes([200, 100, 0xAA, 0xAA])
+    rgba = decode_flag16_bgr_with_alpha_plane(colour + alpha, width=2, height=1)
+    # Alpha plane wins: first pixel A=200, NOT 0.
+    assert rgba[3] == 200
+    assert rgba[7] == 100
+
+
+def test_decode_flag16_tolerates_trailing_bytes():
+    """Trailing-byte tolerance matches flag=0: some records have a few
+    leftover bytes past the last alpha row pad; both reference readers
+    silently discard them."""
+    colour = bytes([1, 2, 3,  4, 5, 6])
+    # width=2 → alpha pad=2 → row is [a0, a1, pad, pad].
+    alpha = bytes([128, 64, 0xAA, 0xAA])
+    src = colour + alpha + b"\xCC\xCC\xCC\xCC"
+    rgba = decode_flag16_bgr_with_alpha_plane(src, width=2, height=1)
+    assert list(rgba) == [3, 2, 1, 128,  6, 5, 4, 64]
+
+
+def test_decode_flag16_truncated_colour_plane_raises():
+    """Antibody #2: if the stream is shorter than `colour_bytes`,
+    the unified byte-count check fires at the top of the function."""
+    # width=2 height=2 needs 12 colour + 8 alpha = 20 bytes. Give 15.
+    src = bytes([1] * 15)
+    with pytest.raises(ImagePixelsDecodeError, match="truncated"):
+        decode_flag16_bgr_with_alpha_plane(src, width=2, height=2)
+
+
+def test_decode_flag16_truncated_alpha_plane_raises():
+    """Antibody #2: a stream long enough for the colour plane but
+    short in the alpha plane still raises — the byte-count check is
+    over the *combined* requirement. A subtle alpha-row-pad miscount
+    would otherwise quietly read OOB past image_data, masked by
+    Python's bounds checks into a cryptic IndexError."""
+    # width=2 height=2: need 20 bytes, give 19 (colour complete,
+    # alpha missing 1 byte).
+    src = bytes([1] * 19)
+    with pytest.raises(ImagePixelsDecodeError, match="truncated"):
+        decode_flag16_bgr_with_alpha_plane(src, width=2, height=2)
+
+
+def test_decode_flag16_non_positive_dimensions_raise():
+    """Antibody #1: zero or negative dims raise before any byte
+    indexing — same defensive posture as flag=0."""
+    for w, h in [(0, 2), (2, 0), (-1, 2), (2, -1)]:
+        with pytest.raises(ImagePixelsDecodeError):
+            decode_flag16_bgr_with_alpha_plane(b"", width=w, height=h)
+
+
 # --- Dispatcher tests (synthetic Image records) -------------------------
 
 
@@ -214,15 +364,6 @@ def test_dispatcher_rejects_non_mode4():
         decode_image_pixels(img)
 
 
-def test_dispatcher_rejects_flag16_as_deferred_work():
-    """Antibody #1 / deferred-work: flag=0x10 (Alpha) raises with a
-    pointer to probe #7.1b. The 85 FNAF 1 records in this bucket all
-    surface through this raise until the alpha-plane path ships."""
-    img = _synth_image(flags=0x10, image_data=b"\x00" * 12)
-    with pytest.raises(ImagePixelsDecodeError, match="probe #7.1b"):
-        decode_image_pixels(img)
-
-
 def test_dispatcher_rejects_arbitrary_unknown_flag():
     """Any non-zero flag combination beyond the 0x10 deferred bucket
     must also raise — no silent fall-through into flag=0's main loop
@@ -250,6 +391,36 @@ def test_dispatcher_returns_decoded_pixels_dataclass():
     assert (dp.width, dp.height) == (2, 2)
     assert len(dp.rgba) == 2 * 2 * 4
     assert list(dp.rgba[:4]) == [3, 2, 1, 255]
+
+
+def test_dispatcher_routes_flag16_to_alpha_decoder():
+    """Happy path: flag=0x10 routes to the alpha-plane decoder and
+    the result carries per-pixel alpha from the trailing plane. This
+    is the test that proves probe #7.1b has flipped from "raises" to
+    "decodes" end-to-end."""
+    # 2×2 stream: 12 colour bytes + 2*(2+2)=8 alpha bytes = 20 total.
+    colour = bytes([1, 2, 3,  4, 5, 6,  7, 8, 9,  10, 11, 12])
+    # Alpha rows [a0, a1, pad, pad] × 2 rows.
+    alpha = bytes([10, 90, 0xAA, 0xAA,   200, 255, 0xAA, 0xAA])
+    img = _synth_image(
+        handle=77,
+        width=2,
+        height=2,
+        flags=0x10,
+        # Include a transparent colour that would key a pixel under
+        # flag=0: we're proving it's *ignored* on the flag=16 path.
+        transparent=(3, 2, 1, 0),
+        image_data=colour + alpha,
+    )
+    dp = decode_image_pixels(img)
+    assert isinstance(dp, DecodedPixels)
+    assert dp.handle == 77
+    # First pixel: BGR=(1,2,3) → RGB=(3,2,1). Alpha from plane, NOT
+    # zeroed by the would-be transparent match.
+    assert list(dp.rgba[:4]) == [3, 2, 1, 10]
+    assert list(dp.rgba[4:8]) == [6, 5, 4, 90]
+    assert list(dp.rgba[8:12]) == [9, 8, 7, 200]
+    assert list(dp.rgba[12:16]) == [12, 11, 10, 255]
 
 
 # --- FNAF 1 multi-input / snapshot (Antibody #5 / #7) -------------------
@@ -311,25 +482,24 @@ def test_fnaf1_all_flag0_records_decode_without_error():
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_flag16_records_all_raise_as_deferred_work():
-    """Deferred-work pin: every flag=0x10 record surfaces as
-    `ImagePixelsDecodeError` until probe #7.1b ships. Pin the count so
-    any future silent reclassification into flag=0 fires loudly."""
+def test_fnaf1_all_flag16_records_decode_without_error():
+    """Antibody #5 multi-input: all 85 flag=0x10 FNAF 1 records decode
+    cleanly; their output is always `w * h * 4` bytes. Any truncation
+    or row-pad miscalculation (most likely the 4-byte alpha pad) would
+    surface here before a snapshot even runs."""
     bank = _fnaf1_image_bank()
     flag16 = [img for img in bank.images if img.flags == 0x10]
     assert len(flag16) == 85, (
-        f"expected 85 flag=0x10 records in FNAF 1; saw {len(flag16)}"
+        f"expected 85 flag=0x10 records in FNAF 1; saw {len(flag16)} "
+        f"— envelope drift or pack mismatch"
     )
-    raised = 0
     for img in flag16:
-        try:
-            decode_image_pixels(img)
-        except ImagePixelsDecodeError:
-            raised += 1
-    assert raised == 85, (
-        f"expected every flag=0x10 record to raise in probe #7.1a; "
-        f"{85 - raised} fell through the dispatcher"
-    )
+        dp = decode_image_pixels(img)
+        expected_len = img.width * img.height * 4
+        assert len(dp.rgba) == expected_len, (
+            f"handle={img.handle} w={img.width} h={img.height}: rgba "
+            f"len={len(dp.rgba)} expected {expected_len}"
+        )
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
@@ -385,3 +555,106 @@ def test_fnaf1_flag0_decoded_pixels_snapshot():
     assert fingerprint == (
         "c7998dc6fee847904346be8171dcbc7f5e80d725a836ddb7fbb7a14667c5a88f"
     )
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_flag16_decoded_pixels_snapshot():
+    """Antibody #7 snapshot: pin total decoded bytes and a SHA-256
+    fingerprint over `(handle, sha256(rgba))` pairs across all 85
+    flag=0x10 records.
+
+    First captured empirically on 2026-04-21 (probe #7.1b). Any
+    single-pixel drift — colour-plane byte-order swap, alpha-plane
+    row-pad miscount, alpha-plane byte order (not expected but
+    possible), or a silent reclassification of any flag=0 record into
+    this bucket — flips the combined hash."""
+    bank = _fnaf1_image_bank()
+    flag16 = [img for img in bank.images if img.flags == 0x10]
+    assert len(flag16) == 85
+
+    total_bytes = 0
+    h = hashlib.sha256()
+    per_record = []
+    for img in flag16:
+        dp = decode_image_pixels(img)
+        total_bytes += len(dp.rgba)
+        rec_sha = hashlib.sha256(dp.rgba).digest()
+        h.update(img.handle.to_bytes(4, "little", signed=True))
+        h.update(rec_sha)
+        per_record.append((img.handle, rec_sha.hex()))
+
+    fingerprint = h.hexdigest()
+
+    # Bootstrap debug print: surfaces empirical values on first run so
+    # the pinned expectations below can be filled in without a separate
+    # inspection pass.
+    print(
+        f"\n[images_pixels flag16 snapshot] flag16_count={len(flag16)} "
+        f"total_bytes={total_bytes} fingerprint={fingerprint}\n"
+        f"first_3={per_record[:3]}\n"
+        f"last_3={per_record[-3:]}"
+    )
+
+    assert total_bytes == sum(
+        img.width * img.height * 4 for img in flag16
+    ), "total_bytes must equal sum of w*h*4 across flag=0x10 records"
+
+    # Pinned empirical values — populate on first successful run from
+    # the debug print above. Sentinel assertions below intentionally
+    # fail at `None` so an unprepared test environment doesn't silently
+    # record the "wrong" snapshot.
+    assert total_bytes == _FLAG16_SNAPSHOT_TOTAL_BYTES
+    assert fingerprint == _FLAG16_SNAPSHOT_FINGERPRINT
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_flag16_alpha_channel_is_non_degenerate():
+    """Alpha-distribution antibody: across all 85 flag=16 records, the
+    output alpha channel must contain **at least three distinct values**
+    AND at least one value that is neither 0 nor 255.
+
+    This catches a regression the snapshot would also catch, but more
+    legibly: if the alpha-plane read is off-by-one or reading from
+    colour-pad bytes, the alpha channel often collapses to constant 0
+    or constant 255 across entire records. The bank-wide histogram
+    gives a loud, labelled error — "alpha channel degenerate" points
+    straight at the alpha plane, while a fingerprint flip doesn't."""
+    bank = _fnaf1_image_bank()
+    flag16 = [img for img in bank.images if img.flags == 0x10]
+    assert len(flag16) == 85
+
+    alpha_values: set[int] = set()
+    for img in flag16:
+        dp = decode_image_pixels(img)
+        # Every 4th byte from offset 3 is an alpha byte.
+        alpha_values.update(dp.rgba[3::4])
+        # Early exit: once we have 3+ distinct values AND at least one
+        # mid-range value, further records can't disprove the claim.
+        if len(alpha_values) >= 3 and any(
+            0 < v < 255 for v in alpha_values
+        ):
+            break
+
+    assert len(alpha_values) >= 3, (
+        f"flag=16 alpha channel is degenerate: only "
+        f"{len(alpha_values)} distinct value(s) across 85 records. "
+        f"Alpha plane likely not being read — colour pad or alpha pad "
+        f"miscount is the first place to look."
+    )
+    assert any(0 < v < 255 for v in alpha_values), (
+        f"flag=16 alpha channel only ever takes values in {{0, 255}} "
+        f"across all 85 records — no anti-aliased edges made it through. "
+        f"Suggests the alpha plane is being read as a 1-bit mask."
+    )
+
+
+# --- Flag=16 snapshot pins ---------------------------------------------
+
+# Pinned empirical values — first captured 2026-04-21 (probe #7.1b
+# bootstrap). Total bytes is separately cross-checked against
+# `sum(w*h*4)` inside the test to separate dimension drift from per-byte
+# drift.
+_FLAG16_SNAPSHOT_TOTAL_BYTES = 108_519_636
+_FLAG16_SNAPSHOT_FINGERPRINT = (
+    "dd2955d1d6f01eeb64b102eea06860985594cb31508ed648c522f8fde762b05e"
+)
