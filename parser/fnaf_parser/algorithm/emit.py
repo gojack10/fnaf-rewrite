@@ -411,18 +411,29 @@ def _sha256_file(path: Path) -> str:
 
 
 def _write_json(path: Path, obj: Any) -> None:
-    """Pretty 2-space-indented JSON with trailing newline (POSIX)."""
+    """Pretty 2-space-indented JSON with trailing newline (POSIX).
+
+    `sort_keys=True` pins dict-key ordering independent of Python's
+    insertion-order guarantee — without this the Algorithm Snapshot
+    Antibody's SHA-256 pin would drift on any decoder refactor that
+    happens to reorder key construction.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(obj, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    """One JSON object per line, no trailing comma, trailing newline."""
+    """One JSON object per line, no trailing comma, trailing newline.
+
+    `sort_keys=True` is mandatory here: `combined.jsonl` is the file
+    the Algorithm Snapshot Antibody pins a SHA-256 on, so its ordering
+    must be deterministic across decoder refactors and Python versions.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps(r, ensure_ascii=False) for r in rows]
+    lines = [json.dumps(r, ensure_ascii=False, sort_keys=True) for r in rows]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
