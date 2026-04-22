@@ -9,6 +9,20 @@ dependencies = [
     "rich>=15.0.0",
 ]
 
+# `fnaf-parser` is the human-facing CLI entry point. Three subcommands:
+#   fnaf-parser parse <exe>
+#   fnaf-parser dump-assets <exe> --out <dir>
+#   fnaf-parser dump-algorithm <exe> --out <dir>   (stub until Output Emission)
+[project.scripts]
+fnaf-parser = "fnaf_parser.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fnaf_parser"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
