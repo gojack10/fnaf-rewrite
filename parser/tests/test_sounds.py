@@ -707,3 +707,220 @@ def test_fnaf1_sound_bank_names_are_nonempty():
     )
     # Basic smoke: at least 28 bytes of header were consumed per sound.
     assert all(s.record_wire_size > SOUND_ITEM_HEADER_SIZE for s in bank.sounds)
+
+
+# --- Probe #9.1 payload-layer antibodies --------------------------------
+#
+# Probe #9 deferred audio_data-content decisions to #9.1. The recon ran
+# on 2026-04-21 and found every FNAF 1 audio_data blob is a complete
+# byte-valid RIFF/WAVE PCM container. These tests pin that empirical
+# fact: if a future pack ships ADPCM / OGG / headerless PCM the decoder
+# fails here before the env-gated audio_emit sink silently writes a
+# file with a .wav extension that isn't actually a WAV.
+
+
+def _parse_riff_fmt(data: bytes) -> dict | None:
+    """Walk top-level RIFF chunks to pull `fmt ` and `data` chunk info.
+
+    Returns None when `data` isn't a valid RIFF/WAVE container (short,
+    wrong magic, or missing WAVE sub-type). On success returns the
+    declared riff size, actual size, a structural consistency flag, the
+    `fmt ` chunk unpacked fields, and the `data` chunk declared size.
+
+    Minimal chunk walker — word-aligns odd-size chunks per RIFF spec.
+    This isn't a full WAV parser: we don't recurse into LIST chunks,
+    don't interpret extensible format headers, don't validate the
+    `data` chunk's content. All that matters here is that `fmt ` is
+    0x0001 (PCM) and the declared lengths reconcile to the blob size.
+    """
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+
+    (riff_size,) = struct.unpack("<I", data[4:8])
+    pos = 12
+    fmt_info: dict | None = None
+    data_chunk_size: int | None = None
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        (chunk_size,) = struct.unpack("<I", data[pos + 4:pos + 8])
+        body_start = pos + 8
+        body_end = body_start + chunk_size
+        if chunk_id == b"fmt " and chunk_size >= 16:
+            (
+                fmt_code,
+                channels,
+                sample_rate,
+                byte_rate,
+                block_align,
+                bits_per_sample,
+            ) = struct.unpack("<HHIIHH", data[body_start:body_start + 16])
+            fmt_info = {
+                "fmt_code": fmt_code,
+                "channels": channels,
+                "sample_rate": sample_rate,
+                "byte_rate": byte_rate,
+                "block_align": block_align,
+                "bits_per_sample": bits_per_sample,
+                "fmt_chunk_size": chunk_size,
+            }
+        elif chunk_id == b"data":
+            data_chunk_size = chunk_size
+        # RIFF chunks are word-aligned — pad odd sizes.
+        pos = body_end + (chunk_size & 1)
+
+    return {
+        "riff_declared_size": riff_size,
+        "actual_total_size": len(data),
+        "riff_declared_fits": riff_size + 8 == len(data),
+        "fmt": fmt_info,
+        "data_chunk_size": data_chunk_size,
+    }
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_sound_bank_all_riff_wave():
+    """Probe #9.1 antibody: every `audio_data` blob must start with
+    `RIFF` + `WAVE`. If this fails, the passthrough `emit_wav` sink
+    would silently produce a `.wav` file that isn't a wav — catching it
+    here before the sink writes anything."""
+    blob, result, transform = _fnaf1_transform_and_records()
+    rec = next(r for r in result.records if r.id == 0x6668)
+    payload = read_chunk_payload(blob, rec, transform=transform)
+    bank = decode_sound_bank(payload)
+
+    non_riff = [
+        (s.raw_handle, s.name, s.audio_data[:4].hex())
+        for s in bank.sounds
+        if not (len(s.audio_data) >= 12
+                and s.audio_data[:4] == b"RIFF"
+                and s.audio_data[8:12] == b"WAVE")
+    ]
+    assert not non_riff, (
+        f"FNAF 1 has {len(non_riff)} audio_data blob(s) that aren't "
+        f"RIFF/WAVE — first 3: {non_riff[:3]}"
+    )
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_sound_bank_all_pcm_format_code():
+    """Probe #9.1 antibody: every fmt chunk must declare fmt_code
+    0x0001 (uncompressed PCM). ADPCM (0x0002), IMA ADPCM (0x0011), and
+    every other coded format would need real decoding before playback —
+    emit_wav's passthrough only works for PCM.
+
+    If a future pack ships a non-PCM sound, this fires, and the fix
+    belongs at a `decoders/sounds_audio.py` module (not shipped yet —
+    no demand on FNAF 1)."""
+    blob, result, transform = _fnaf1_transform_and_records()
+    rec = next(r for r in result.records if r.id == 0x6668)
+    payload = read_chunk_payload(blob, rec, transform=transform)
+    bank = decode_sound_bank(payload)
+
+    non_pcm: list[tuple[int, str, int]] = []
+    for snd in bank.sounds:
+        info = _parse_riff_fmt(snd.audio_data)
+        assert info is not None, (
+            f"raw_handle={snd.raw_handle} name={snd.name!r}: "
+            f"couldn't parse RIFF/WAVE header"
+        )
+        fmt = info["fmt"]
+        assert fmt is not None, (
+            f"raw_handle={snd.raw_handle} name={snd.name!r}: "
+            f"no fmt chunk found"
+        )
+        if fmt["fmt_code"] != 0x0001:
+            non_pcm.append((snd.raw_handle, snd.name, fmt["fmt_code"]))
+
+    assert not non_pcm, (
+        f"FNAF 1 has {len(non_pcm)} non-PCM sound(s) — first 3: "
+        f"{non_pcm[:3]}. emit_wav's passthrough path only handles "
+        f"fmt_code 0x0001; a real decoder is needed for the rest."
+    )
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_sound_bank_riff_size_matches_audio_data_size():
+    """Probe #9.1 antibody: the RIFF-declared size field must reconcile
+    to `len(audio_data)`. On disk this is the `riff_size + 8 ==
+    total_file_size` invariant for single-RIFF files.
+
+    A mismatch would mean our decoder's inner-zlib stripped or
+    appended bytes, or that Clickteam wrapped something other than the
+    raw file — either case breaks the passthrough contract."""
+    blob, result, transform = _fnaf1_transform_and_records()
+    rec = next(r for r in result.records if r.id == 0x6668)
+    payload = read_chunk_payload(blob, rec, transform=transform)
+    bank = decode_sound_bank(payload)
+
+    mismatches: list[tuple[int, str, int, int]] = []
+    for snd in bank.sounds:
+        info = _parse_riff_fmt(snd.audio_data)
+        assert info is not None, f"raw_handle={snd.raw_handle} not RIFF/WAVE"
+        if not info["riff_declared_fits"]:
+            mismatches.append((
+                snd.raw_handle,
+                snd.name,
+                info["riff_declared_size"],
+                info["actual_total_size"],
+            ))
+    assert not mismatches, (
+        f"{len(mismatches)} sound(s) where RIFF declared size + 8 != "
+        f"len(audio_data). First 3: {mismatches[:3]}"
+    )
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_sound_bank_audio_params_snapshot():
+    """Probe #9.1 antibody #7 snapshot: pin the FNAF 1 audio parameter
+    distribution (rate/channels/bps/data-size) against drift.
+
+    Captured empirically 2026-04-21 (probe #9.1 recon):
+    - 52/52 fmt_code 0x0001 PCM
+    - sample rates: 22050 Hz × 42, 44100 Hz × 9, 11025 Hz × 1
+    - channels:     mono × 49, stereo × 3
+    - bps:          16 × 51, 8 × 1
+
+    The SHA fingerprint captures the per-record tuple
+    `(raw_handle, fmt_code, sample_rate, channels, bps, data_chunk_size)`
+    — catches any per-record drift even if histograms happen to match."""
+    blob, result, transform = _fnaf1_transform_and_records()
+    rec = next(r for r in result.records if r.id == 0x6668)
+    payload = read_chunk_payload(blob, rec, transform=transform)
+    bank = decode_sound_bank(payload)
+
+    fmt_codes = Counter()
+    sample_rates = Counter()
+    channels_hist = Counter()
+    bps_hist = Counter()
+    params_blob = b""
+    for snd in bank.sounds:
+        info = _parse_riff_fmt(snd.audio_data)
+        assert info is not None and info["fmt"] is not None
+        f = info["fmt"]
+        fmt_codes[f["fmt_code"]] += 1
+        sample_rates[f["sample_rate"]] += 1
+        channels_hist[f["channels"]] += 1
+        bps_hist[f["bits_per_sample"]] += 1
+        params_blob += struct.pack(
+            "<IHHIHHI",
+            snd.raw_handle,
+            f["fmt_code"],
+            f["channels"],
+            f["sample_rate"],
+            f["bits_per_sample"],
+            0,  # pad to align — keeps the struct layout stable
+            info["data_chunk_size"] or 0,
+        )
+
+    params_sha = hashlib.sha256(params_blob).hexdigest()
+
+    # Histogram pins — easy to read, fail loudly:
+    assert fmt_codes == {0x0001: 52}
+    assert sample_rates == {22050: 42, 44100: 9, 11025: 1}
+    assert channels_hist == {1: 49, 2: 3}
+    assert bps_hist == {16: 51, 8: 1}
+    # Per-record fingerprint pin — catches name-file-drift or any
+    # single-record parameter change that leaves histograms intact.
+    assert params_sha == (
+        "5641ab825255e726527b778862b79ef649ef96dac032a69d59cbaa890729e859"
+    )
