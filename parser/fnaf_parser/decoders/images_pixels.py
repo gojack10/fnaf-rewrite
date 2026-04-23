@@ -118,6 +118,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from fnaf_parser.decoders.images import Image
 
 
@@ -277,32 +279,39 @@ def decode_flag0_bgr_masked(
     # alignment. See module docstring for rationale.
     tr_r, tr_g, tr_b, _tr_a = transparent
 
-    out = bytearray(width * height * IMAGE_PIXELS_OUT_BYTES_PER_PIXEL)
-    src = image_data
-    src_pos = 0
-    dst_pos = 0
+    # Vectorised BGR → RGBA via numpy. Parse the padded stream as
+    # (height, row_total_bytes), drop the tail padding, reshape to
+    # (height, width, 3) BGR. Channel-swap into a pre-allocated
+    # (height, width, 4) RGBA and set alpha in one masked write.
+    #
+    # 605 images × up to 1280×960 pixels in pure-Python bytearray
+    # indexing was ~100s of the pytest session; numpy frombuffer +
+    # ufunc compare drops that to ~1s. Byte output is identical —
+    # the snapshot test (SHA-256 over every handle's rgba) is the
+    # oracle for "semantically equivalent rewrite".
+    raw = np.frombuffer(image_data, dtype=np.uint8, count=required_bytes)
+    bgr = raw.reshape(height, row_total_bytes)[:, :row_payload_bytes].reshape(
+        height, width, IMAGE_PIXELS_MODE_4_BYTES_PER_PIXEL
+    )
 
-    for _y in range(height):
-        # Inline the per-pixel loop: Python method-call overhead dwarfs
-        # the cost of an indexed read, so an explicit counter + direct
-        # byte indexing outperforms slicing/iterating on a decompressed
-        # record. 605 images × up to 1280×960 pixels: hot path.
-        for _x in range(width):
-            b = src[src_pos]
-            g = src[src_pos + 1]
-            r = src[src_pos + 2]
-            out[dst_pos] = r
-            out[dst_pos + 1] = g
-            out[dst_pos + 2] = b
-            if r == tr_r and g == tr_g and b == tr_b:
-                out[dst_pos + 3] = 0
-            else:
-                out[dst_pos + 3] = 255
-            src_pos += IMAGE_PIXELS_MODE_4_BYTES_PER_PIXEL
-            dst_pos += IMAGE_PIXELS_OUT_BYTES_PER_PIXEL
-        src_pos += row_pad_bytes
+    rgba = np.empty(
+        (height, width, IMAGE_PIXELS_OUT_BYTES_PER_PIXEL), dtype=np.uint8
+    )
+    rgba[..., 0] = bgr[..., 2]  # R ← stream byte 2
+    rgba[..., 1] = bgr[..., 1]  # G ← stream byte 1
+    rgba[..., 2] = bgr[..., 0]  # B ← stream byte 0
+    rgba[..., 3] = 255
 
-    return bytes(out)
+    # Transparent mask: in-stream (b, g, r) == (tr_b, tr_g, tr_r).
+    # bgr[..., 0] is the first wire byte per pixel = B, hence == tr_b.
+    mask = (
+        (bgr[..., 0] == tr_b)
+        & (bgr[..., 1] == tr_g)
+        & (bgr[..., 2] == tr_r)
+    )
+    rgba[..., 3][mask] = 0
+
+    return rgba.tobytes()
 
 
 def decode_flag16_bgr_with_alpha_plane(
@@ -367,40 +376,34 @@ def decode_flag16_bgr_with_alpha_plane(
             f"Antibody #2 byte-count — truncated stream."
         )
 
-    out = bytearray(width * height * IMAGE_PIXELS_OUT_BYTES_PER_PIXEL)
-    src = image_data
+    # Vectorised two-pass decode via numpy. Same contract as the
+    # per-pixel loop: pass 1 builds (R, G, B, 255) per pixel from the
+    # BGR colour plane; pass 2 overwrites A with the 8bpp alpha plane.
+    # See `decode_flag0_bgr_masked` for the frombuffer/reshape pattern.
+    rgba = np.empty(
+        (height, width, IMAGE_PIXELS_OUT_BYTES_PER_PIXEL), dtype=np.uint8
+    )
 
     # --- Pass 1: colour plane (BGR → RGBA, no transparent keying) -------
-    src_pos = 0
-    dst_pos = 0
-    for _y in range(height):
-        for _x in range(width):
-            b = src[src_pos]
-            g = src[src_pos + 1]
-            r = src[src_pos + 2]
-            out[dst_pos] = r
-            out[dst_pos + 1] = g
-            out[dst_pos + 2] = b
-            out[dst_pos + 3] = 255  # overwritten in pass 2
-            src_pos += IMAGE_PIXELS_MODE_4_BYTES_PER_PIXEL
-            dst_pos += IMAGE_PIXELS_OUT_BYTES_PER_PIXEL
-        src_pos += colour_pad
+    colour_raw = np.frombuffer(image_data, dtype=np.uint8, count=colour_bytes)
+    bgr = colour_raw.reshape(height, colour_row_total)[
+        :, : width * IMAGE_PIXELS_MODE_4_BYTES_PER_PIXEL
+    ].reshape(height, width, IMAGE_PIXELS_MODE_4_BYTES_PER_PIXEL)
+    rgba[..., 0] = bgr[..., 2]
+    rgba[..., 1] = bgr[..., 1]
+    rgba[..., 2] = bgr[..., 0]
+    # A is written in pass 2 — skip the transient 255 fill.
 
     # --- Pass 2: alpha plane (write A by destination index) -------------
-    # src_pos is now exactly `colour_bytes` — we've consumed the whole
-    # colour plane. Writing by destination index (y*width + x) rather
-    # than running the dst cursor again keeps the 4-byte alpha-pad
-    # handling self-evident and mirrors CTFAK2:65-70.
-    for y in range(height):
-        row_dst_base = y * width * IMAGE_PIXELS_OUT_BYTES_PER_PIXEL
-        for x in range(width):
-            out[
-                row_dst_base + x * IMAGE_PIXELS_OUT_BYTES_PER_PIXEL + 3
-            ] = src[src_pos]
-            src_pos += 1
-        src_pos += alpha_pad
+    # The alpha plane starts exactly `colour_bytes` into image_data —
+    # the colour plane's row padding has already been accounted for by
+    # `colour_bytes = height * colour_row_total` above.
+    alpha_raw = np.frombuffer(
+        image_data, dtype=np.uint8, offset=colour_bytes, count=alpha_bytes
+    )
+    rgba[..., 3] = alpha_raw.reshape(height, alpha_row_total)[:, :width]
 
-    return bytes(out)
+    return rgba.tobytes()
 
 
 def decode_image_pixels(image: Image) -> DecodedPixels:
