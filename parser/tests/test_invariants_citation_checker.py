@@ -92,6 +92,49 @@ def _combined_doc() -> dict[str, Any]:
                     }
                 ],
             },
+            {
+                # Frame 2 carries a two-expression-parameter action —
+                # the SetChannelVolume shape that stress-tests the
+                # reverse-direction + all-exprs-in-pseudo strategies.
+                "frame_index": 2,
+                "frame_name": "Frame 2",
+                "event_groups": [
+                    {
+                        "conditions": [],
+                        "actions": [
+                            {
+                                "num_name": "SetChannelVolume",
+                                "parameters": [
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "2",
+                                    },
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "100",
+                                    },
+                                ],
+                            },
+                            {
+                                # Single expression param with expr_str '1' —
+                                # used to prove that `'1'` does not
+                                # substring-match inside `'100'` under
+                                # the word-boundary guard.
+                                "num_name": "SetCounterValue",
+                                "parameters": [
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "1",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
         ],
     }
 
@@ -114,7 +157,10 @@ def test_load_combined_keyed_by_four_tuple(combined_json: Path):
     assert (0, 0, "action", 0) in combined
     assert (1, 0, "condition", 0) in combined
     assert (1, 0, "action", 0) in combined
-    assert len(combined) == 4
+    # Frame 2 adds two more action rows (no conditions in that frame).
+    assert (2, 0, "action", 0) in combined
+    assert (2, 0, "action", 1) in combined
+    assert len(combined) == 6
 
 
 def test_load_combined_preserves_row_fields(combined_json: Path):
@@ -170,6 +216,118 @@ def test_expr_str_match_is_case_and_whitespace_insensitive(combined_json: Path):
     result = verify_record(combined, rec)
     assert result.accepted
     assert result.outcomes[0].reason == "expr_str_match"
+
+
+def test_expr_str_reverse_match_accepts_whole_action_pseudo(
+    combined_json: Path,
+):
+    """Bucket A recovery: the line cook cites pi=0 (expr_str='2') but
+    emits a whole-action pseudo `SetChannelVolume(2, 100)`. The forward
+    substring check fails (big pseudo doesn't fit in tiny expr_str),
+    but the cited param's expr_str IS a standalone token inside the
+    pseudo — accept via `expr_str_reverse_match`."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="The Speaker channel volume is set to 100 for channel 2.",
+        citations=[
+            Citation(
+                frame=2,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+                parameter_index=0,
+            )
+        ],
+        pseudo_code="SetChannelVolume(2, 100)",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "expr_str_reverse_match"
+
+
+def test_expr_str_reverse_match_word_boundary_blocks_digit_smoosh(
+    combined_json: Path,
+):
+    """Word-boundary guard: expr_str='1' must NOT match inside larger
+    numeric literals like '100'. The naïve substring would accept;
+    `\\b1\\b` rejects. Absent this guard, the reverse strategy would
+    silently rubber-stamp any pseudo that merely mentions a digit."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Counter value mentions 100 somewhere.",
+        citations=[
+            Citation(
+                frame=2,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=1,
+                parameter_index=0,
+            )
+        ],
+        pseudo_code="set counter = 100",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
+
+
+def test_all_exprs_in_pseudo_accepts_when_every_expr_is_token(
+    combined_json: Path,
+):
+    """Bucket B recovery: pi=None citation at a multi-param action
+    where both expression params' expr_strs ('2' and '100') appear as
+    tokens inside the whole-action pseudo `SetChannelVolume(2, 100)`.
+    No single expr_str contains the pseudo (forward fails), but the
+    pseudo faithfully covers every expression param → accept via
+    `all_exprs_in_pseudo`."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Speaker channel 2 volume set to 100.",
+        citations=[
+            Citation(
+                frame=2,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+                # Deliberately pi=None — whole-action citation.
+            )
+        ],
+        pseudo_code="SetChannelVolume(2, 100)",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "all_exprs_in_pseudo"
+
+
+def test_all_exprs_in_pseudo_rejects_when_one_expr_missing(
+    combined_json: Path,
+):
+    """The all-exprs strategy is strict: if even one expression param's
+    expr_str is absent from the pseudo, reject. Prevents a half-truthful
+    claim from sneaking through when the pseudo only mentions some of
+    the call's arguments."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Partial claim missing the '100' literal.",
+        citations=[
+            Citation(
+                frame=2,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+            )
+        ],
+        # Pseudo only mentions '2' — '100' is absent, so the all-exprs
+        # gate holds.
+        pseudo_code="SetChannelVolume(2, something_else)",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
 
 
 def test_short_label_match_accepts_quoted_label(combined_json: Path):

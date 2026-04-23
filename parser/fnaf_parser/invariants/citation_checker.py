@@ -28,15 +28,29 @@ Verification ladder (cheapest → most expensive)
    record's `pseudo_code` appears verbatim (case-insensitive,
    whitespace-normalised) anywhere in the cited row's `expr_str`,
    auto-accept with reason `"expr_str_match"`.
-4. **SHORT label match** — for codes 10/26 (SHORT) that carry a
+4. **expr_str reverse match** (pi=int only) — if the cited parameter's
+   `expr_str` appears as a standalone token inside the record's
+   `pseudo_code`, auto-accept with reason
+   `"expr_str_reverse_match"`. Catches whole-action summaries like
+   `SetChannelVolume(2, 100)` cited at pi=0 where the per-parameter
+   `expr_str` is just `'2'`. Word-boundary guarded so `'1'` doesn't
+   trivially match inside `'100'`.
+5. **All-exprs-in-pseudo** (pi=None only) — if *every*
+   EXPRESSION-bearing parameter's `expr_str` appears as a standalone
+   token inside the record's `pseudo_code`, auto-accept with reason
+   `"all_exprs_in_pseudo"`. Catches whole-action claims (no
+   `parameter_index`) that faithfully summarise the call, like pseudo
+   `Ini('beatgame', 0)` against two expression params whose expr_strs
+   are `"'beatgame'"` and `'0'`.
+6. **SHORT label match** — for codes 10/26 (SHORT) that carry a
    decoded `label`, if the record's `pseudo_code` quotes the exact
    label, auto-accept with reason `"short_label_match"`.
-5. **Num-name match** — the cited row's `num_name` appears in the
+7. **Num-name match** — the cited row's `num_name` appears in the
    record's `claim` or `pseudo_code`. Weak signal → accept with
    reason `"num_name_match"` only when kind is
    `event_trigger`/`state_transition` (where num_name is the
    operative word), reject otherwise.
-6. **No match** — quarantine with reason
+8. **No match** — quarantine with reason
    `"no_verification_strategy_matched"`.
 
 Output files
@@ -191,6 +205,29 @@ def _normalise(s: str) -> str:
     return _WHITESPACE_RE.sub(" ", s.strip().lower())
 
 
+def _expr_str_token_in(expr_str_norm: str, pseudo_norm: str) -> bool:
+    """Return True if `expr_str_norm` appears as a standalone token
+    inside `pseudo_norm`.
+
+    Word boundaries (`\\b`) are required only at edges where
+    `expr_str_norm` itself has a word character. If it begins or ends
+    with a symbol (paren, quote, operator), that symbol is already a
+    boundary, so adding `\\b` would be wrong — `\\b` requires a
+    word/non-word transition and two adjacent non-word characters
+    would fail to match.
+
+    This prevents the classic false accept where a single-digit
+    expr_str like `'1'` is naively-substring-matched inside a larger
+    numeric literal like `'100'`.
+    """
+    if not expr_str_norm:
+        return False
+    left = r"\b" if (expr_str_norm[0].isalnum() or expr_str_norm[0] == "_") else ""
+    right = r"\b" if (expr_str_norm[-1].isalnum() or expr_str_norm[-1] == "_") else ""
+    pattern = left + re.escape(expr_str_norm) + right
+    return re.search(pattern, pseudo_norm) is not None
+
+
 # --- Verification strategies --------------------------------------------
 
 
@@ -199,12 +236,27 @@ def _check_expr_str(
     cit: Citation,
     record: InvariantRecord,
 ) -> str | None:
-    """Return an accept reason if `record.pseudo_code` appears verbatim
-    (normalised) in any EXPRESSION-bearing parameter's `expr_str`, else
-    None.
+    """Match the record's `pseudo_code` against EXPRESSION-bearing
+    parameters using three nested strategies, returning the first
+    accept-reason that fires (or None to fall through to the next
+    rung of the ladder).
 
-    When `cit.parameter_index` is set, only that parameter is checked;
-    otherwise every EXPRESSION-bearing parameter is checked.
+    Strategies, in priority order:
+
+    1. `expr_str_match` (forward) — `pseudo_code` appears verbatim
+       inside some expression param's `expr_str`. Tightest; used when
+       the line cook emitted a narrow per-parameter fragment.
+    2. `expr_str_reverse_match` — when `pi=int`, the cited param's
+       `expr_str` appears as a standalone token inside `pseudo_code`.
+       Catches whole-action summaries pinned at one param.
+    3. `all_exprs_in_pseudo` — when `pi=None`, *every*
+       expression-bearing param's `expr_str` appears as a standalone
+       token in `pseudo_code`. Strong evidence the pseudo is a
+       faithful whole-action summary.
+
+    Strategies 2 and 3 are guarded by a word-boundary test (see
+    `_expr_str_token_in`) so a single-digit `expr_str` can't match
+    inside a larger numeric literal.
     """
     params = row.get("parameters", [])
     if cit.parameter_index is not None:
@@ -217,6 +269,8 @@ def _check_expr_str(
     needle = _normalise(record.pseudo_code)
     if not needle:
         return None
+
+    # 1. Forward substring: pseudo_code ⊆ expr_str.
     for p in candidates:
         if p.get("code") not in _EXPRESSION_CODES:
             continue
@@ -225,7 +279,44 @@ def _check_expr_str(
             continue
         if needle in _normalise(expr_str):
             return "expr_str_match"
-    return None
+
+    # Collect the subset of candidates that are expression-bearing and
+    # carry a non-empty expr_str — both reverse strategies need at
+    # least one such param to have anything to match against.
+    expr_params: list[dict[str, Any]] = []
+    for p in candidates:
+        if p.get("code") not in _EXPRESSION_CODES:
+            continue
+        expr_str = p.get("expr_str")
+        if isinstance(expr_str, str) and expr_str:
+            expr_params.append(p)
+    if not expr_params:
+        return None
+
+    # 2. Reverse substring (pi=int only): the cited param's expr_str
+    #    appears as a standalone token inside pseudo_code.
+    if cit.parameter_index is not None:
+        # `candidates` was restricted to the single cited param; so
+        # `expr_params` has at most one entry here.
+        expr_str_norm = _normalise(expr_params[0]["expr_str"])
+        if _expr_str_token_in(expr_str_norm, needle):
+            return "expr_str_reverse_match"
+        return None
+
+    # 3. All-exprs-in-pseudo (pi=None): require EVERY expression
+    #    param's expr_str to be a token in the pseudo. Using the
+    #    unrestricted candidates list — if any expression param is
+    #    missing an expr_str (empty/non-string), we can't prove the
+    #    pseudo faithfully covers the whole call, so bail.
+    for p in candidates:
+        if p.get("code") not in _EXPRESSION_CODES:
+            continue
+        expr_str = p.get("expr_str")
+        if not isinstance(expr_str, str) or not expr_str:
+            return None
+        if not _expr_str_token_in(_normalise(expr_str), needle):
+            return None
+    return "all_exprs_in_pseudo"
 
 
 def _check_short_label(
