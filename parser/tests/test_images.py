@@ -34,11 +34,9 @@ from __future__ import annotations
 import hashlib
 import struct
 import zlib
-from pathlib import Path
 
 import pytest
 
-from fnaf_parser.chunk_walker import walk_chunks
 from fnaf_parser.compression import read_chunk_payload
 from fnaf_parser.decoders.image_offsets import decode_image_offsets
 from fnaf_parser.decoders.images import (
@@ -50,12 +48,14 @@ from fnaf_parser.decoders.images import (
     ImageDecodeError,
     decode_image_bank,
 )
-from fnaf_parser.decoders.strings import decode_string_chunk
-from fnaf_parser.encryption import make_transform
-from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
 from tests.fnaf1_constants import FNAF1_BANK_OFFSET_DELTA
 
-FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
+# FNAF 1 integration tests below pull their blob / walk_chunks result /
+# RC4 transform / decoded ImageBank from session-scoped fixtures in
+# conftest.py (`fnaf1_exe_bytes`, `fnaf1_walk_result`, `fnaf1_transform`,
+# `fnaf1_image_bank`). The per-module `_fnaf1_transform_and_records()`
+# helper + `FNAF_EXE` constant + `walk_chunks` / `make_transform` /
+# `decode_string_chunk` imports are all gone.
 
 # Empirical pack-level delta — see `tests/fnaf1_constants.py`. Images
 # was the first probe to observe it (probe #7); sounds (probe #9) and
@@ -296,51 +296,16 @@ def test_as_dict_shape_is_stable():
 # --- FNAF 1 multi-input / snapshot / cross-chunk ------------------------
 
 
-def _fnaf1_transform_and_records():
-    """Walk the FNAF 1 pack with the RC4 transform enabled so
-    read_chunk_payload can decode any chunk. Mirrors the helper in
-    test_image_offsets.py."""
-    blob = FNAF_EXE.read_bytes()
-    result = walk_chunks(FNAF_EXE, pack_start=FNAF1_DATA_PACK_START)
-
-    def _str_of(chunk_id: int) -> str:
-        rec = next(r for r in result.records if r.id == chunk_id)
-        return decode_string_chunk(
-            read_chunk_payload(blob, rec), unicode=result.header.unicode
-        )
-
-    editor = _str_of(0x222E)
-    name = _str_of(0x2224)
-    copyright_records = [r for r in result.records if r.id == 0x223B]
-    copyright_str = (
-        decode_string_chunk(
-            read_chunk_payload(blob, copyright_records[0]),
-            unicode=result.header.unicode,
-        )
-        if copyright_records
-        else ""
-    )
-    transform = make_transform(
-        editor=editor,
-        name=name,
-        copyright_str=copyright_str,
-        build=result.header.product_build,
-        unicode=result.header.unicode,
-    )
-    return blob, result, transform
-
-
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_image_bank_decodes_without_error():
+def test_fnaf1_image_bank_decodes_without_error(
+    fnaf1_walk_result, fnaf1_image_bank: ImageBank
+):
     """Antibody #5 multi-input: the full FNAF 1 0x6666 payload decodes
     without raising and produces a non-empty ImageBank."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    recs = [r for r in result.records if r.id == 0x6666]
+    recs = [r for r in fnaf1_walk_result.records if r.id == 0x6666]
     assert len(recs) == 1, (
         f"FNAF 1 should carry exactly one 0x6666 chunk; saw {len(recs)}"
     )
-    payload = read_chunk_payload(blob, recs[0], transform=transform)
-    bank = decode_image_bank(payload)
+    bank = fnaf1_image_bank
     assert bank.count > 0
     # Every image must carry at least the 32-byte inner header's
     # worth of decompressed bytes. The decoder guarantees this
@@ -352,8 +317,12 @@ def test_fnaf1_image_bank_decodes_without_error():
         assert 0 <= img.flags <= 255
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_image_bank_snapshot():
+def test_fnaf1_image_bank_snapshot(
+    fnaf1_exe_bytes: bytes,
+    fnaf1_walk_result,
+    fnaf1_transform,
+    fnaf1_image_bank: ImageBank,
+):
     """Antibody #7 snapshot: pin the FNAF 1 0x6666 decode against drift.
 
     Captured empirically on 2026-04-21 (probe #7):
@@ -380,15 +349,14 @@ def test_fnaf1_image_bank_snapshot():
     Any single-byte drift in the outer-decompressed payload changes the
     SHA. Any per-image header-field drift changes the histograms.
     """
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6666)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_image_bank(payload)
+    bank = fnaf1_image_bank
 
     # Non-zero offset count in 0x5555 was 605 (distinct_count=606
     # including the zero bucket). Tie the two directly.
-    offsets_rec = next(r for r in result.records if r.id == 0x5555)
-    offsets_payload = read_chunk_payload(blob, offsets_rec, transform=transform)
+    offsets_rec = next(r for r in fnaf1_walk_result.records if r.id == 0x5555)
+    offsets_payload = read_chunk_payload(
+        fnaf1_exe_bytes, offsets_rec, transform=fnaf1_transform
+    )
     image_offsets = decode_image_offsets(offsets_payload)
     non_zero_offsets = {o for o in image_offsets.offsets if o != 0}
     assert bank.count == len(non_zero_offsets), (
@@ -428,8 +396,12 @@ def test_fnaf1_image_bank_snapshot():
     assert fl_hist == {0: 520, 16: 85}
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_image_bank_cross_chunk_handshake_with_delta():
+def test_fnaf1_image_bank_cross_chunk_handshake_with_delta(
+    fnaf1_exe_bytes: bytes,
+    fnaf1_walk_result,
+    fnaf1_transform,
+    fnaf1_image_bank: ImageBank,
+):
     """Cross-chunk antibody (load-bearing): for every image record `R`
     in the bank, the 0x5555 offset keyed by `R.handle` must equal
     `R.record_start_offset + FNAF1_IMAGE_OFFSET_DELTA` (delta = 260).
@@ -485,15 +457,13 @@ def test_fnaf1_image_bank_cross_chunk_handshake_with_delta():
     Any drift on any of those breaks the per-record delta immediately,
     and the error message names the offending handle.
     """
-    blob, result, transform = _fnaf1_transform_and_records()
-
-    offsets_rec = next(r for r in result.records if r.id == 0x5555)
-    offsets_payload = read_chunk_payload(blob, offsets_rec, transform=transform)
+    offsets_rec = next(r for r in fnaf1_walk_result.records if r.id == 0x5555)
+    offsets_payload = read_chunk_payload(
+        fnaf1_exe_bytes, offsets_rec, transform=fnaf1_transform
+    )
     image_offsets = decode_image_offsets(offsets_payload)
 
-    images_rec = next(r for r in result.records if r.id == 0x6666)
-    images_payload = read_chunk_payload(blob, images_rec, transform=transform)
-    bank = decode_image_bank(images_payload)
+    bank = fnaf1_image_bank
 
     # Tie the cardinality first: every distinct non-zero offset must be
     # referenced by exactly one record, and vice versa. Both sides count
@@ -538,16 +508,14 @@ def test_fnaf1_image_bank_cross_chunk_handshake_with_delta():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_image_bank_logical_handles_are_unique():
+def test_fnaf1_image_bank_logical_handles_are_unique(
+    fnaf1_image_bank: ImageBank,
+):
     """Structural invariant: after the build-284 `raw - 1` adjustment
     every logical handle must be unique. A collision would mean the
     build adjustment is wrong for this pack, or a record was decoded
     twice."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6666)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_image_bank(payload)
+    bank = fnaf1_image_bank
 
     handles = [img.handle for img in bank.images]
     assert len(handles) == len(set(handles)), (

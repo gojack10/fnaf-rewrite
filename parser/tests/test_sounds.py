@@ -38,11 +38,9 @@ import hashlib
 import struct
 import zlib
 from collections import Counter
-from pathlib import Path
 
 import pytest
 
-from fnaf_parser.chunk_walker import walk_chunks
 from fnaf_parser.compression import read_chunk_payload
 from fnaf_parser.decoders.sound_offsets import decode_sound_offsets
 from fnaf_parser.decoders.sounds import (
@@ -57,12 +55,14 @@ from fnaf_parser.decoders.sounds import (
     decode_sound_bank,
     sound_flag_names,
 )
-from fnaf_parser.decoders.strings import decode_string_chunk
-from fnaf_parser.encryption import make_transform
-from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
 from tests.fnaf1_constants import FNAF1_BANK_OFFSET_DELTA
 
-FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
+# FNAF 1 integration tests below pull their blob / walk_chunks result /
+# RC4 transform / decoded SoundBank from session-scoped fixtures in
+# conftest.py (`fnaf1_exe_bytes`, `fnaf1_walk_result`, `fnaf1_transform`,
+# `fnaf1_sound_bank`). The per-module `_fnaf1_transform_and_records()`
+# helper + `FNAF_EXE` constant + `walk_chunks` / `make_transform` /
+# `decode_string_chunk` imports are all gone.
 
 # Alias for local readability — see `tests/fnaf1_constants.py`. Probe #9
 # confirmed the same +260 delta first observed in probe #7 (images) and
@@ -397,55 +397,17 @@ def test_as_dict_shape_is_stable():
 # --- FNAF 1 multi-input / snapshot / cross-chunk ------------------------
 
 
-def _fnaf1_transform_and_records():
-    """Walk the FNAF 1 pack with the RC4 transform enabled so
-    read_chunk_payload can decode any chunk. Mirrors the helper in
-    test_images.py."""
-    blob = FNAF_EXE.read_bytes()
-    result = walk_chunks(FNAF_EXE, pack_start=FNAF1_DATA_PACK_START)
-
-    def _str_of(chunk_id: int) -> str:
-        rec = next(r for r in result.records if r.id == chunk_id)
-        return decode_string_chunk(
-            read_chunk_payload(blob, rec), unicode=result.header.unicode
-        )
-
-    editor = _str_of(0x222E)
-    name = _str_of(0x2224)
-    copyright_records = [r for r in result.records if r.id == 0x223B]
-    copyright_str = (
-        decode_string_chunk(
-            read_chunk_payload(blob, copyright_records[0]),
-            unicode=result.header.unicode,
-        )
-        if copyright_records
-        else ""
-    )
-    transform = make_transform(
-        editor=editor,
-        name=name,
-        copyright_str=copyright_str,
-        build=result.header.product_build,
-        unicode=result.header.unicode,
-    )
-    return blob, result, transform
-
-
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_decodes_without_error():
+def test_fnaf1_sound_bank_decodes_without_error(fnaf1_walk_result, fnaf1_sound_bank: SoundBank):
     """Antibody #5 multi-input: the full FNAF 1 0x6668 payload decodes
     without raising and produces a non-empty SoundBank."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    recs = [r for r in result.records if r.id == 0x6668]
+    recs = [r for r in fnaf1_walk_result.records if r.id == 0x6668]
     assert len(recs) == 1, (
         f"FNAF 1 should carry exactly one 0x6668 chunk; saw {len(recs)}"
     )
-    payload = read_chunk_payload(blob, recs[0], transform=transform)
-    bank = decode_sound_bank(payload)
-    assert bank.count > 0
+    assert fnaf1_sound_bank.count > 0
     # Every sound must carry at least the 28-byte header's worth of
     # metadata and a non-negative audio payload.
-    for snd in bank.sounds:
+    for snd in fnaf1_sound_bank.sounds:
         assert isinstance(snd, Sound)
         assert snd.decompressed_size >= 0
         assert 0 <= snd.flags <= 0xFFFFFFFF
@@ -453,8 +415,7 @@ def test_fnaf1_sound_bank_decodes_without_error():
         assert 2 * snd.name_length <= snd.decompressed_size
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_no_playfromdisk_wave_items():
+def test_fnaf1_sound_bank_no_playfromdisk_wave_items(fnaf1_sound_bank: SoundBank):
     """Structural invariant: no item on FNAF 1 has `flags == 33`
     (PlayFromDisk + Wave). That combo triggers CTFAK2's
     `soundData.Seek(0)` quirk we've deliberately NOT implemented.
@@ -464,13 +425,8 @@ def test_fnaf1_sound_bank_no_playfromdisk_wave_items():
     the fix is to teach the decoder the seek-0 semantics; don't just
     delete the assertion.
     """
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
-
     trippers = [
-        snd for snd in bank.sounds if snd.flags == SOUND_FLAGS_PLAYFROMDISK_WAVE
+        snd for snd in fnaf1_sound_bank.sounds if snd.flags == SOUND_FLAGS_PLAYFROMDISK_WAVE
     ]
     assert not trippers, (
         f"FNAF 1 unexpectedly has {len(trippers)} SoundItem(s) with "
@@ -481,8 +437,12 @@ def test_fnaf1_sound_bank_no_playfromdisk_wave_items():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_snapshot():
+def test_fnaf1_sound_bank_snapshot(
+    fnaf1_exe_bytes: bytes,
+    fnaf1_walk_result,
+    fnaf1_transform,
+    fnaf1_sound_bank: SoundBank,
+):
     """Antibody #7 snapshot: pin the FNAF 1 0x6668 decode against drift.
 
     Captured empirically on 2026-04-21 (probe #9). Values will be filled
@@ -490,10 +450,7 @@ def test_fnaf1_sound_bank_snapshot():
     verified before the pinned constants so a future drift reports a
     structural problem first, not a mystery integer mismatch.
     """
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     # Structural invariants (true regardless of pack):
     assert len(bank.record_start_offsets) == bank.count
@@ -506,8 +463,10 @@ def test_fnaf1_sound_bank_snapshot():
     )
 
     # Tie to 0x5557 non-zero count for reassurance before pinning:
-    offsets_rec = next(r for r in result.records if r.id == 0x5557)
-    offsets_payload = read_chunk_payload(blob, offsets_rec, transform=transform)
+    offsets_rec = next(r for r in fnaf1_walk_result.records if r.id == 0x5557)
+    offsets_payload = read_chunk_payload(
+        fnaf1_exe_bytes, offsets_rec, transform=fnaf1_transform
+    )
     sound_offsets = decode_sound_offsets(offsets_payload)
     non_zero_offsets = {o for o in sound_offsets.offsets if o != 0}
     assert bank.count == len(non_zero_offsets), (
@@ -557,8 +516,12 @@ def test_fnaf1_sound_bank_snapshot():
     assert total_audio == 97345706
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_cross_chunk_handshake_with_delta():
+def test_fnaf1_sound_bank_cross_chunk_handshake_with_delta(
+    fnaf1_exe_bytes: bytes,
+    fnaf1_walk_result,
+    fnaf1_transform,
+    fnaf1_sound_bank: SoundBank,
+):
     """Cross-chunk antibody (load-bearing): for every sound record `R`
     in the bank, the 0x5557 offset keyed by `R`'s handle must equal
     `R.record_start_offset + FNAF1_SOUND_OFFSET_DELTA`.
@@ -582,15 +545,13 @@ def test_fnaf1_sound_bank_cross_chunk_handshake_with_delta():
       line up wins — that's how we close the CTFAK2-vs-Anaconda oracle
       disagreement captured in probe #9's ideation node.
     """
-    blob, result, transform = _fnaf1_transform_and_records()
-
-    offsets_rec = next(r for r in result.records if r.id == 0x5557)
-    offsets_payload = read_chunk_payload(blob, offsets_rec, transform=transform)
+    offsets_rec = next(r for r in fnaf1_walk_result.records if r.id == 0x5557)
+    offsets_payload = read_chunk_payload(
+        fnaf1_exe_bytes, offsets_rec, transform=fnaf1_transform
+    )
     sound_offsets = decode_sound_offsets(offsets_payload)
 
-    sounds_rec = next(r for r in result.records if r.id == 0x6668)
-    sounds_payload = read_chunk_payload(blob, sounds_rec, transform=transform)
-    bank = decode_sound_bank(sounds_payload)
+    bank = fnaf1_sound_bank
 
     non_zero_offsets = [o for o in sound_offsets.offsets if o != 0]
     assert len(non_zero_offsets) == bank.count == 52, (
@@ -671,15 +632,11 @@ def test_fnaf1_sound_bank_cross_chunk_handshake_with_delta():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_handles_are_unique():
+def test_fnaf1_sound_bank_handles_are_unique(fnaf1_sound_bank: SoundBank):
     """Structural invariant: both raw and logical handles must be
     unique. A collision would mean either the bank repeats a record or
     the `-1` adjustment lost information."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     raw = [s.raw_handle for s in bank.sounds]
     assert len(raw) == len(set(raw)), (
@@ -690,15 +647,11 @@ def test_fnaf1_sound_bank_handles_are_unique():
     assert len(adj) == len(set(adj))
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_names_are_nonempty():
+def test_fnaf1_sound_bank_names_are_nonempty(fnaf1_sound_bank: SoundBank):
     """Structural invariant: every sound has a non-empty name. A sound
     with an empty name is either decoder drift or a corrupted record —
     empirically FNAF 1 labels every sound."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     empty = [s for s in bank.sounds if not s.name]
     assert not empty, (
@@ -777,16 +730,12 @@ def _parse_riff_fmt(data: bytes) -> dict | None:
     }
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_all_riff_wave():
+def test_fnaf1_sound_bank_all_riff_wave(fnaf1_sound_bank: SoundBank):
     """Probe #9.1 antibody: every `audio_data` blob must start with
     `RIFF` + `WAVE`. If this fails, the passthrough `emit_wav` sink
     would silently produce a `.wav` file that isn't a wav — catching it
     here before the sink writes anything."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     non_riff = [
         (s.raw_handle, s.name, s.audio_data[:4].hex())
@@ -801,8 +750,7 @@ def test_fnaf1_sound_bank_all_riff_wave():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_all_pcm_format_code():
+def test_fnaf1_sound_bank_all_pcm_format_code(fnaf1_sound_bank: SoundBank):
     """Probe #9.1 antibody: every fmt chunk must declare fmt_code
     0x0001 (uncompressed PCM). ADPCM (0x0002), IMA ADPCM (0x0011), and
     every other coded format would need real decoding before playback —
@@ -811,10 +759,7 @@ def test_fnaf1_sound_bank_all_pcm_format_code():
     If a future pack ships a non-PCM sound, this fires, and the fix
     belongs at a `decoders/sounds_audio.py` module (not shipped yet —
     no demand on FNAF 1)."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     non_pcm: list[tuple[int, str, int]] = []
     for snd in bank.sounds:
@@ -838,8 +783,9 @@ def test_fnaf1_sound_bank_all_pcm_format_code():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_riff_size_matches_audio_data_size():
+def test_fnaf1_sound_bank_riff_size_matches_audio_data_size(
+    fnaf1_sound_bank: SoundBank,
+):
     """Probe #9.1 antibody: the RIFF-declared size field must reconcile
     to `len(audio_data)`. On disk this is the `riff_size + 8 ==
     total_file_size` invariant for single-RIFF files.
@@ -847,10 +793,7 @@ def test_fnaf1_sound_bank_riff_size_matches_audio_data_size():
     A mismatch would mean our decoder's inner-zlib stripped or
     appended bytes, or that Clickteam wrapped something other than the
     raw file — either case breaks the passthrough contract."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     mismatches: list[tuple[int, str, int, int]] = []
     for snd in bank.sounds:
@@ -869,8 +812,7 @@ def test_fnaf1_sound_bank_riff_size_matches_audio_data_size():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_sound_bank_audio_params_snapshot():
+def test_fnaf1_sound_bank_audio_params_snapshot(fnaf1_sound_bank: SoundBank):
     """Probe #9.1 antibody #7 snapshot: pin the FNAF 1 audio parameter
     distribution (rate/channels/bps/data-size) against drift.
 
@@ -883,10 +825,7 @@ def test_fnaf1_sound_bank_audio_params_snapshot():
     The SHA fingerprint captures the per-record tuple
     `(raw_handle, fmt_code, sample_rate, channels, bps, data_chunk_size)`
     — catches any per-record drift even if histograms happen to match."""
-    blob, result, transform = _fnaf1_transform_and_records()
-    rec = next(r for r in result.records if r.id == 0x6668)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    bank = decode_sound_bank(payload)
+    bank = fnaf1_sound_bank
 
     fmt_codes = Counter()
     sample_rates = Counter()

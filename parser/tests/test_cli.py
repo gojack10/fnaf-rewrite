@@ -171,6 +171,7 @@ def test_parse_dispatch_emits_chunks_seen(
     assert len(payload["chunks"]) > 0
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF 1 binary not on disk")
 def test_dump_assets_dispatch_writes_images_and_audio(tmp_path: Path):
     """End-to-end smoke: `fnaf-parser dump-assets` writes PNGs + WAVs.

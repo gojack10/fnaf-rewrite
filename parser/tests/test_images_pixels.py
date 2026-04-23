@@ -29,13 +29,10 @@ Antibody coverage:
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
 import pytest
 
-from fnaf_parser.chunk_walker import walk_chunks
-from fnaf_parser.compression import read_chunk_payload
-from fnaf_parser.decoders.images import Image, decode_image_bank
+from fnaf_parser.decoders.images import Image
 from fnaf_parser.decoders.images_pixels import (
     DecodedPixels,
     ImagePixelsDecodeError,
@@ -45,11 +42,11 @@ from fnaf_parser.decoders.images_pixels import (
     get_alpha_row_padding_bytes,
     get_row_padding_bytes,
 )
-from fnaf_parser.decoders.strings import decode_string_chunk
-from fnaf_parser.encryption import make_transform
-from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
 
-FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
+# The FNAF 1 integration tests below pull the decoded ImageBank from the
+# session-scoped `fnaf1_image_bank` fixture in conftest.py (skips cleanly
+# when the binary isn't on disk). The old per-module `_fnaf1_image_bank()`
+# helper + `FNAF_EXE` constant are gone.
 
 
 # --- Row padding (pure function) ----------------------------------------
@@ -424,56 +421,28 @@ def test_dispatcher_routes_flag16_to_alpha_decoder():
 
 
 # --- FNAF 1 multi-input / snapshot (Antibody #5 / #7) -------------------
+#
+# The 0x6666 ImageBank is decoded once per session by the `fnaf1_image_bank`
+# fixture in conftest.py. Tests that used to call a per-module
+# `_fnaf1_image_bank()` helper now declare the fixture as a parameter — that
+# alone shaved ~110 s off the default run (the two flag0 suites share one
+# decode instead of running it twice).
 
 
-def _fnaf1_image_bank():
-    """Decode the FNAF 1 0x6666 ImageBank envelope. Helper mirrors the
-    one in test_images.py — RC4 transform derived from header strings."""
-    blob = FNAF_EXE.read_bytes()
-    result = walk_chunks(FNAF_EXE, pack_start=FNAF1_DATA_PACK_START)
-
-    def _str_of(chunk_id: int) -> str:
-        rec = next(r for r in result.records if r.id == chunk_id)
-        return decode_string_chunk(
-            read_chunk_payload(blob, rec), unicode=result.header.unicode
-        )
-
-    editor = _str_of(0x222E)
-    name = _str_of(0x2224)
-    copyright_records = [r for r in result.records if r.id == 0x223B]
-    copyright_str = (
-        decode_string_chunk(
-            read_chunk_payload(blob, copyright_records[0]),
-            unicode=result.header.unicode,
-        )
-        if copyright_records
-        else ""
-    )
-    transform = make_transform(
-        editor=editor,
-        name=name,
-        copyright_str=copyright_str,
-        build=result.header.product_build,
-        unicode=result.header.unicode,
-    )
-
-    rec = next(r for r in result.records if r.id == 0x6666)
-    payload = read_chunk_payload(blob, rec, transform=transform)
-    return decode_image_bank(payload)
-
-
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_all_flag0_records_decode_without_error():
+def test_fnaf1_all_flag0_records_decode_without_error(
+    fnaf1_flag0_decoded_pixels: tuple[tuple[Image, DecodedPixels], ...],
+):
     """Antibody #5 multi-input: all 520 flag=0 FNAF 1 records decode
-    cleanly; their output is always exactly `w * h * 4` bytes."""
-    bank = _fnaf1_image_bank()
-    flag0 = [img for img in bank.images if img.flags == 0]
-    assert len(flag0) == 520, (
-        f"expected 520 flag=0 records in FNAF 1; saw {len(flag0)} "
-        f"— envelope drift or pack mismatch"
+    cleanly; their output is always exactly `w * h * 4` bytes.
+
+    The decode itself is done once per session by the
+    `fnaf1_flag0_decoded_pixels` fixture; this test only verifies the
+    shape invariant (output length == w*h*4)."""
+    assert len(fnaf1_flag0_decoded_pixels) == 520, (
+        f"expected 520 flag=0 records in FNAF 1; saw "
+        f"{len(fnaf1_flag0_decoded_pixels)} — envelope drift or pack mismatch"
     )
-    for img in flag0:
-        dp = decode_image_pixels(img)
+    for img, dp in fnaf1_flag0_decoded_pixels:
         expected_len = img.width * img.height * 4
         assert len(dp.rgba) == expected_len, (
             f"handle={img.handle} w={img.width} h={img.height}: rgba "
@@ -481,20 +450,21 @@ def test_fnaf1_all_flag0_records_decode_without_error():
         )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_all_flag16_records_decode_without_error():
+def test_fnaf1_all_flag16_records_decode_without_error(
+    fnaf1_flag16_decoded_pixels: tuple[tuple[Image, DecodedPixels], ...],
+):
     """Antibody #5 multi-input: all 85 flag=0x10 FNAF 1 records decode
     cleanly; their output is always `w * h * 4` bytes. Any truncation
     or row-pad miscalculation (most likely the 4-byte alpha pad) would
-    surface here before a snapshot even runs."""
-    bank = _fnaf1_image_bank()
-    flag16 = [img for img in bank.images if img.flags == 0x10]
-    assert len(flag16) == 85, (
-        f"expected 85 flag=0x10 records in FNAF 1; saw {len(flag16)} "
-        f"— envelope drift or pack mismatch"
+    surface here before a snapshot even runs.
+
+    Shares `fnaf1_flag16_decoded_pixels` with the snapshot + alpha-
+    distribution tests so the 85-record decode runs once per session."""
+    assert len(fnaf1_flag16_decoded_pixels) == 85, (
+        f"expected 85 flag=0x10 records in FNAF 1; saw "
+        f"{len(fnaf1_flag16_decoded_pixels)} — envelope drift or pack mismatch"
     )
-    for img in flag16:
-        dp = decode_image_pixels(img)
+    for img, dp in fnaf1_flag16_decoded_pixels:
         expected_len = img.width * img.height * 4
         assert len(dp.rgba) == expected_len, (
             f"handle={img.handle} w={img.width} h={img.height}: rgba "
@@ -502,8 +472,9 @@ def test_fnaf1_all_flag16_records_decode_without_error():
         )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_flag0_decoded_pixels_snapshot():
+def test_fnaf1_flag0_decoded_pixels_snapshot(
+    fnaf1_flag0_decoded_pixels: tuple[tuple[Image, DecodedPixels], ...],
+):
     """Antibody #7 snapshot: pin total decoded bytes and a SHA-256
     fingerprint over `(handle, sha256(rgba))` pairs across all 520
     flag=0 records.
@@ -514,15 +485,12 @@ def test_fnaf1_flag0_decoded_pixels_snapshot():
     combined hash. The error message names nothing, but a failure here
     points straight at `decode_flag0_bgr_masked` or its inputs.
     """
-    bank = _fnaf1_image_bank()
-    flag0 = [img for img in bank.images if img.flags == 0]
-    assert len(flag0) == 520
+    assert len(fnaf1_flag0_decoded_pixels) == 520
 
     total_bytes = 0
     h = hashlib.sha256()
     per_record = []
-    for img in flag0:
-        dp = decode_image_pixels(img)
+    for img, dp in fnaf1_flag0_decoded_pixels:
         total_bytes += len(dp.rgba)
         rec_sha = hashlib.sha256(dp.rgba).digest()
         h.update(img.handle.to_bytes(4, "little", signed=True))
@@ -535,7 +503,7 @@ def test_fnaf1_flag0_decoded_pixels_snapshot():
     # snapshot expectations below can be bootstrapped without a separate
     # inspection pass.
     print(
-        f"\n[images_pixels snapshot] flag0_count={len(flag0)} "
+        f"\n[images_pixels snapshot] flag0_count={len(fnaf1_flag0_decoded_pixels)} "
         f"total_bytes={total_bytes} fingerprint={fingerprint}\n"
         f"first_3={per_record[:3]}\n"
         f"last_3={per_record[-3:]}"
@@ -543,7 +511,7 @@ def test_fnaf1_flag0_decoded_pixels_snapshot():
 
     # Pinned empirical values — first captured 2026-04-21 (probe #7.1a).
     assert total_bytes == sum(
-        img.width * img.height * 4 for img in flag0
+        img.width * img.height * 4 for img, _ in fnaf1_flag0_decoded_pixels
     ), "total_bytes must equal sum of w*h*4 across flag=0 records"
 
     # Pinned empirical values captured 2026-04-21 (probe #7.1a
@@ -557,8 +525,9 @@ def test_fnaf1_flag0_decoded_pixels_snapshot():
     )
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_flag16_decoded_pixels_snapshot():
+def test_fnaf1_flag16_decoded_pixels_snapshot(
+    fnaf1_flag16_decoded_pixels: tuple[tuple[Image, DecodedPixels], ...],
+):
     """Antibody #7 snapshot: pin total decoded bytes and a SHA-256
     fingerprint over `(handle, sha256(rgba))` pairs across all 85
     flag=0x10 records.
@@ -568,15 +537,12 @@ def test_fnaf1_flag16_decoded_pixels_snapshot():
     row-pad miscount, alpha-plane byte order (not expected but
     possible), or a silent reclassification of any flag=0 record into
     this bucket — flips the combined hash."""
-    bank = _fnaf1_image_bank()
-    flag16 = [img for img in bank.images if img.flags == 0x10]
-    assert len(flag16) == 85
+    assert len(fnaf1_flag16_decoded_pixels) == 85
 
     total_bytes = 0
     h = hashlib.sha256()
     per_record = []
-    for img in flag16:
-        dp = decode_image_pixels(img)
+    for img, dp in fnaf1_flag16_decoded_pixels:
         total_bytes += len(dp.rgba)
         rec_sha = hashlib.sha256(dp.rgba).digest()
         h.update(img.handle.to_bytes(4, "little", signed=True))
@@ -589,14 +555,15 @@ def test_fnaf1_flag16_decoded_pixels_snapshot():
     # the pinned expectations below can be filled in without a separate
     # inspection pass.
     print(
-        f"\n[images_pixels flag16 snapshot] flag16_count={len(flag16)} "
+        f"\n[images_pixels flag16 snapshot] "
+        f"flag16_count={len(fnaf1_flag16_decoded_pixels)} "
         f"total_bytes={total_bytes} fingerprint={fingerprint}\n"
         f"first_3={per_record[:3]}\n"
         f"last_3={per_record[-3:]}"
     )
 
     assert total_bytes == sum(
-        img.width * img.height * 4 for img in flag16
+        img.width * img.height * 4 for img, _ in fnaf1_flag16_decoded_pixels
     ), "total_bytes must equal sum of w*h*4 across flag=0x10 records"
 
     # Pinned empirical values — populate on first successful run from
@@ -607,8 +574,9 @@ def test_fnaf1_flag16_decoded_pixels_snapshot():
     assert fingerprint == _FLAG16_SNAPSHOT_FINGERPRINT
 
 
-@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
-def test_fnaf1_flag16_alpha_channel_is_non_degenerate():
+def test_fnaf1_flag16_alpha_channel_is_non_degenerate(
+    fnaf1_flag16_decoded_pixels: tuple[tuple[Image, DecodedPixels], ...],
+):
     """Alpha-distribution antibody: across all 85 flag=16 records, the
     output alpha channel must contain **at least three distinct values**
     AND at least one value that is neither 0 nor 255.
@@ -619,13 +587,10 @@ def test_fnaf1_flag16_alpha_channel_is_non_degenerate():
     or constant 255 across entire records. The bank-wide histogram
     gives a loud, labelled error — "alpha channel degenerate" points
     straight at the alpha plane, while a fingerprint flip doesn't."""
-    bank = _fnaf1_image_bank()
-    flag16 = [img for img in bank.images if img.flags == 0x10]
-    assert len(flag16) == 85
+    assert len(fnaf1_flag16_decoded_pixels) == 85
 
     alpha_values: set[int] = set()
-    for img in flag16:
-        dp = decode_image_pixels(img)
+    for _img, dp in fnaf1_flag16_decoded_pixels:
         # Every 4th byte from offset 3 is an alpha byte.
         alpha_values.update(dp.rgba[3::4])
         # Early exit: once we have 3+ distinct values AND at least one

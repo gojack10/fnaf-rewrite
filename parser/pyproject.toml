@@ -29,3 +29,10 @@ packages = ["fnaf_parser"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Slow-marked tests (currently just the full CLI asset-dump smoke, which
+# decodes and writes every image + sound and takes ~3 minutes) are
+# excluded from the default `pytest` run. Dedicated decoder / sink tests
+# already cover the content; re-run the smoke explicitly with
+#   uv run pytest -m slow
+# to exercise the end-to-end dispatch.
+addopts = "-m 'not slow'"
