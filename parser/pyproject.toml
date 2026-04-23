@@ -5,7 +5,9 @@ description = "FNAF 1 Clickteam data-pack parser"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dspy>=3.2.0",
     "duckdb>=1.5.2",
+    "pydantic>=2.9.0",
     "pytest>=9.0.3",
     "rich>=15.0.0",
 ]

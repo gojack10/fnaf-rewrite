@@ -28,10 +28,11 @@ FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.
 # --- Argparse surface --------------------------------------------------
 
 
-def test_build_parser_exposes_three_subcommands():
-    """The CLI exposes exactly `parse`, `dump-assets`, `dump-algorithm`.
+def test_build_parser_exposes_four_subcommands():
+    """The CLI exposes exactly `parse`, `dump-assets`, `dump-algorithm`,
+    and `extract-invariants`.
 
-    If a future work unit adds a fourth subcommand, update this list
+    If a future work unit adds a fifth subcommand, update this list
     deliberately — silently widening the CLI surface is the kind of
     drift the Parity Maintenance habit is meant to catch.
     """
@@ -43,6 +44,7 @@ def test_build_parser_exposes_three_subcommands():
         "parse",
         "dump-assets",
         "dump-algorithm",
+        "extract-invariants",
     }
 
 
@@ -62,6 +64,77 @@ def test_dump_algorithm_requires_out_flag():
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["dump-algorithm", "some.exe"])
+
+
+def test_extract_invariants_requires_all_four_flags():
+    """All four --slice / --combined-jsonl / --combined-json / --out flags
+    are required; argparse should reject a call missing any of them."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["extract-invariants"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "extract-invariants",
+                "--slice",
+                "c",
+                "--combined-jsonl",
+                "x.jsonl",
+                "--out",
+                "out",
+            ]
+        )  # missing --combined-json
+
+
+def test_extract_invariants_slice_choices_enforced():
+    """--slice only accepts a, b, or c; `d` must be rejected by argparse."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "extract-invariants",
+                "--slice",
+                "d",
+                "--combined-jsonl",
+                "x.jsonl",
+                "--combined-json",
+                "x.json",
+                "--out",
+                "out",
+            ]
+        )
+
+
+def test_extract_invariants_missing_api_key_exits_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When OPENROUTER_API_KEY is unset, the CLI must exit 3 (not crash
+    with a DSPy traceback). The remediation message is the actual
+    contract — if this exits 1 the user-facing UX is broken.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Create minimal combined.jsonl + combined.json so argparse doesn't
+    # trip on file-not-found before the config error has a chance to
+    # fire. The handler must fail on the missing API key, not on I/O.
+    jsonl_path = tmp_path / "combined.jsonl"
+    json_path = tmp_path / "combined.json"
+    jsonl_path.write_text("", encoding="utf-8")
+    json_path.write_text('{"frames": []}', encoding="utf-8")
+
+    exit_code = main(
+        [
+            "extract-invariants",
+            "--slice",
+            "c",
+            "--combined-jsonl",
+            str(jsonl_path),
+            "--combined-json",
+            str(json_path),
+            "--out",
+            str(tmp_path / "inv-out"),
+        ]
+    )
+    assert exit_code == 3
 
 
 def test_no_subcommand_errors():

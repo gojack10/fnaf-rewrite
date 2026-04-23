@@ -31,6 +31,15 @@ CLI Scaffolding replaces that with a proper argparse tree:
         action per line) + `manifest.json` (navigation index with
         SHA-256 hashes).
 
+    fnaf-parser extract-invariants --slice {a,b,c} \\
+            --combined-jsonl <path> --combined-json <path> --out <dir>
+        DSPy.RLM invariant-extraction pipeline. Reads the specified
+        Scout Pass slice from `combined.jsonl`, dispatches tickets to
+        the line-cook Signature via OpenRouter, and writes three
+        artefacts: `raw_records.jsonl`, `accepted.jsonl`,
+        `quarantine.jsonl`. Requires `OPENROUTER_API_KEY` — missing key
+        exits with code 3 and a one-shot remediation message.
+
 Env-var compatibility
 ---------------------
 
@@ -47,6 +56,7 @@ Exit codes
 - 0: success (expected case)
 - 1: semantic failure (e.g. PE data-pack start mismatches expected)
 - 2: argparse usage error — raised by argparse itself
+- 3: OpenRouter config error — `OPENROUTER_API_KEY` missing or empty
 """
 
 from __future__ import annotations
@@ -73,6 +83,13 @@ from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START, pe_data_pack_start
 from fnaf_parser.pipeline import load_pack
 from fnaf_parser.sinks.audio_emit import emit_wav
 from fnaf_parser.sinks.png_emit import emit_png
+
+# Invariant-extraction imports are kept at module scope (no lazy gate)
+# because the handler is pure-Python until `pipeline.run()` is called;
+# the `OpenRouterConfigError` surface is how the CLI detects the
+# missing-key case without ever touching DSPy internals.
+from fnaf_parser.invariants.config import OpenRouterConfigError
+from fnaf_parser.invariants.pipeline import run as run_invariants
 
 
 # --- Chunk IDs used by the CLI dispatch layer ---------------------------
@@ -241,6 +258,32 @@ def cmd_dump_algorithm(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Subcommand: extract-invariants -------------------------------------
+
+
+def cmd_extract_invariants(args: argparse.Namespace) -> int:
+    """`fnaf-parser extract-invariants --slice <a|b|c> ...` — DSPy.RLM pilot.
+
+    Thin wrapper around `invariants.pipeline.run`. Catches
+    `OpenRouterConfigError` and maps it to exit code 3 with the config
+    module's remediation message verbatim — so the user sees `export
+    OPENROUTER_API_KEY=...` instructions instead of a DSPy traceback.
+    """
+    console = Console()
+    try:
+        summary = run_invariants(
+            slice_name=args.slice,
+            combined_jsonl=args.combined_jsonl,
+            combined_json=args.combined_json,
+            out_dir=args.out,
+        )
+    except OpenRouterConfigError as exc:
+        console.print(f"[red]config error:[/red] {exc}")
+        return 3
+    console.print_json(json.dumps(summary.to_log_dict()))
+    return 0
+
+
 # --- Argparse tree ------------------------------------------------------
 
 
@@ -310,6 +353,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (auto-created).",
     )
     alg_p.set_defaults(func=cmd_dump_algorithm)
+
+    # extract-invariants
+    inv_p = subparsers.add_parser(
+        "extract-invariants",
+        help="DSPy.RLM invariant-extraction pipeline (requires OPENROUTER_API_KEY).",
+        description=(
+            "Run the head-chef dispatch loop over the specified Scout "
+            "Pass slice. Reads combined.jsonl via DuckDB, dispatches "
+            "tickets to the line-cook Signature, writes raw + "
+            "accepted + quarantine JSONL. OPENROUTER_API_KEY must be "
+            "set; missing key exits 3 with a remediation message."
+        ),
+    )
+    inv_p.add_argument(
+        "--slice",
+        choices=("a", "b", "c"),
+        required=True,
+        help="Scout Pass slice: a=by op, b=by object bucket, c=EXPRESSION params (pilot).",
+    )
+    inv_p.add_argument(
+        "--combined-jsonl",
+        type=Path,
+        required=True,
+        help="Path to combined.jsonl (row-per-line, DuckDB source).",
+    )
+    inv_p.add_argument(
+        "--combined-json",
+        type=Path,
+        required=True,
+        help="Path to combined.json (same pack; feeds Citation Checker).",
+    )
+    inv_p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Output directory for raw/accepted/quarantine JSONL.",
+    )
+    inv_p.set_defaults(func=cmd_extract_invariants)
 
     return parser
 
