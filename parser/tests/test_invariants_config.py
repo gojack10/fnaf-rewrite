@@ -13,6 +13,8 @@ from fnaf_parser.invariants.config import (
     OPENROUTER_API_BASE,
     OpenRouterConfig,
     OpenRouterConfigError,
+    _DEFAULT_HEAD_CHEF_MODEL,
+    _DEFAULT_LINE_COOK_MODEL,
     load_config,
 )
 
@@ -36,11 +38,16 @@ def test_load_config_from_injected_env():
 
 
 def test_default_models_applied_when_only_key_set():
-    """If only the key is set, both model slugs fall back to the pilot
-    default — single-model mode."""
+    """If only the key is set, each seat falls back to its own pilot
+    default — the line cook gets the smaller worker slug, the head chef
+    gets the reasoner slug. Both route through LiteLLM's `openrouter/`
+    provider prefix."""
     cfg = load_config(env={"OPENROUTER_API_KEY": "sk-or-v1-xxxx"})
-    assert cfg.line_cook_model == cfg.head_chef_model
+    assert cfg.line_cook_model == _DEFAULT_LINE_COOK_MODEL
+    assert cfg.head_chef_model == _DEFAULT_HEAD_CHEF_MODEL
+    assert cfg.line_cook_model != cfg.head_chef_model
     assert cfg.line_cook_model.startswith("openrouter/")
+    assert cfg.head_chef_model.startswith("openrouter/")
 
 
 def test_head_chef_defaults_to_line_cook_when_only_line_cook_overridden():

@@ -12,9 +12,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from fnaf_parser.invariants.extract_signature import ExtractInvariants
 from fnaf_parser.invariants.signatures import (
     Citation,
-    ExtractInvariants,
     InvariantRecord,
 )
 

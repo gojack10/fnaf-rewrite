@@ -2,12 +2,17 @@
 
 We inject:
 - a fake `OpenRouterConfig` so `load_config` isn't called
-- a stub `predictor_factory` so `dspy.Predict(ExtractInvariants)` is
+- a stub `line_cook_factory` so `dspy.Predict(ExtractInvariants)` is
+  never constructed
+- a stub `head_chef_factory` so `dspy.Predict(ReviewInvariants)` is
   never constructed
 
-No API key required. The stub returns canned InvariantRecords so we
-can verify the pipeline's dispatch + JSONL writing + citation checker
-hand-off all work end-to-end, independent of the LLM.
+No API key required. Stubs return canned InvariantRecords so we can
+verify the two-phase dispatch + JSONL writing + citation checker
+hand-off all work end-to-end, independent of the LLM. The default
+head-chef stub (`_PassThroughChef`) preserves the line-cook candidates
+unchanged so tests that only care about line-cook wiring don't need to
+reason about filter semantics.
 """
 
 from __future__ import annotations
@@ -104,9 +109,35 @@ class _CannedPredictor:
         return _FakePrediction(self._records)
 
 
+class _PassThroughChef:
+    """Replaces `dspy.Predict(ReviewInvariants)`. Returns the
+    line-cook candidates unchanged so tests that only care about
+    line-cook wiring don't need to reason about filter semantics.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        tickets: list[dict[str, Any]],
+        candidates: list[InvariantRecord],
+    ) -> _FakePrediction:
+        self.calls.append({"tickets": tickets, "candidates": list(candidates)})
+        return _FakePrediction(list(candidates))
+
+
 def _fake_config() -> OpenRouterConfig:
+    # Two distinct slugs so a misrouted build_*_lm call would be
+    # obvious in any future test that inspects the LM; the current
+    # tests don't exercise the LM build path (stubs replace Predict),
+    # but keeping the slugs distinct avoids encoding an assumption of
+    # identity that could bite later.
     return OpenRouterConfig(
-        api_key="sk-or-v1-test", line_cook_model="m", head_chef_model="m"
+        api_key="sk-or-v1-test",
+        line_cook_model="openrouter/fake/line-cook",
+        head_chef_model="openrouter/fake/head-chef",
     )
 
 
@@ -147,13 +178,16 @@ def test_pipeline_writes_all_three_artefacts(tmp_path: Path):
         combined_json=_json(tmp_path),
         out_dir=out_dir,
         config=_fake_config(),
-        predictor_factory=lambda: predictor,
+        line_cook_factory=lambda: predictor,
+        head_chef_factory=lambda: _PassThroughChef(),
     )
     assert isinstance(summary, RunSummary)
     assert summary.tickets_dispatched == 1
+    assert summary.candidates_emitted == 1
     assert summary.records_emitted == 1
     assert summary.accepted == 1
     assert summary.quarantined == 0
+    assert summary.candidates_path.exists()
     assert summary.raw_records_path.exists()
     assert summary.accepted_path.exists()
     assert summary.quarantine_path.exists()
@@ -186,7 +220,8 @@ def test_pipeline_quarantines_bad_coordinate_records(tmp_path: Path):
         combined_json=_json(tmp_path),
         out_dir=tmp_path / "out",
         config=_fake_config(),
-        predictor_factory=lambda: predictor,
+        line_cook_factory=lambda: predictor,
+        head_chef_factory=lambda: _PassThroughChef(),
     )
     assert summary.accepted == 0
     assert summary.quarantined == 1
@@ -224,8 +259,10 @@ def test_pipeline_accepts_dict_records_from_stub(tmp_path: Path):
         combined_json=_json(tmp_path),
         out_dir=tmp_path / "out",
         config=_fake_config(),
-        predictor_factory=lambda: _DictPredictor(),
+        line_cook_factory=lambda: _DictPredictor(),
+        head_chef_factory=lambda: _PassThroughChef(),
     )
+    assert summary.candidates_emitted == 1
     assert summary.records_emitted == 1
     assert summary.accepted == 1
 
@@ -237,13 +274,130 @@ def test_run_summary_log_dict_stringifies_paths(tmp_path: Path):
     summary = RunSummary(
         slice_name="c",
         tickets_dispatched=1,
+        candidates_emitted=2,
         records_emitted=1,
         accepted=1,
         quarantined=0,
+        candidates_path=tmp_path / "cand.jsonl",
         raw_records_path=tmp_path / "raw.jsonl",
         accepted_path=tmp_path / "acc.jsonl",
         quarantine_path=tmp_path / "q.jsonl",
     )
     blob = json.dumps(summary.to_log_dict())  # must not raise
+    assert "cand.jsonl" in blob
     assert "acc.jsonl" in blob
     assert "q.jsonl" in blob
+
+
+def test_head_chef_filters_line_cook_candidates(tmp_path: Path):
+    """End-to-end: line cook emits 2 candidates, head chef keeps 1.
+
+    Verifies the two-phase wiring: candidates_emitted reflects the
+    line-cook output, records_emitted reflects the head-chef-approved
+    subset, and each artefact file carries the right count.
+    """
+    pytest.importorskip("dspy")
+
+    good = InvariantRecord(
+        claim="Night counter advances by one.",
+        citations=[
+            Citation(
+                frame=0,
+                event_group_index=0,
+                type="condition",
+                cond_or_act_index=0,
+            )
+        ],
+        pseudo_code="Night + 1",
+        kind="numeric_assignment",
+    )
+    noise = InvariantRecord(
+        claim="Weakly grounded paraphrase that head chef should drop.",
+        citations=[
+            Citation(
+                frame=0,
+                event_group_index=0,
+                type="condition",
+                cond_or_act_index=0,
+            )
+        ],
+        pseudo_code="noise",
+        kind="other",
+    )
+
+    class _KeepFirstChef:
+        """Drop everything except the first candidate — stand-in for
+        the head chef's real filter behaviour."""
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def __call__(
+            self,
+            *,
+            tickets: list[dict[str, Any]],
+            candidates: list[InvariantRecord],
+        ) -> _FakePrediction:
+            self.calls.append(
+                {"tickets": tickets, "candidates": list(candidates)}
+            )
+            return _FakePrediction(list(candidates)[:1])
+
+    out_dir = tmp_path / "out"
+    chef = _KeepFirstChef()
+    summary = run(
+        slice_name="c",
+        combined_jsonl=_jsonl(tmp_path),
+        combined_json=_json(tmp_path),
+        out_dir=out_dir,
+        config=_fake_config(),
+        line_cook_factory=lambda: _CannedPredictor([good, noise]),
+        head_chef_factory=lambda: chef,
+    )
+
+    # Counts reflect the filter.
+    assert summary.candidates_emitted == 2
+    assert summary.records_emitted == 1
+    assert summary.accepted == 1
+    assert summary.quarantined == 0
+
+    # Artefact files carry the right pre- and post-review counts.
+    cand_lines = summary.candidates_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    raw_lines = summary.raw_records_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(cand_lines) == 2
+    assert len(raw_lines) == 1
+
+    # Head chef actually saw both candidates (1 call for the single
+    # Slice C ticket).
+    assert len(chef.calls) == 1
+    assert len(chef.calls[0]["candidates"]) == 2
+
+
+def test_head_chef_skipped_when_line_cook_emits_nothing(tmp_path: Path):
+    """If the line cook returns no candidates, the head chef must not
+    be called — there's nothing to review and we'd waste a token round-
+    trip. `candidates_emitted == 0`, `records_emitted == 0`.
+    """
+    pytest.importorskip("dspy")
+
+    class _TrackingChef(_PassThroughChef):
+        pass
+
+    chef = _TrackingChef()
+    summary = run(
+        slice_name="c",
+        combined_jsonl=_jsonl(tmp_path),
+        combined_json=_json(tmp_path),
+        out_dir=tmp_path / "out",
+        config=_fake_config(),
+        line_cook_factory=lambda: _CannedPredictor([]),
+        head_chef_factory=lambda: chef,
+    )
+
+    assert summary.candidates_emitted == 0
+    assert summary.records_emitted == 0
+    assert chef.calls == []  # never invoked
