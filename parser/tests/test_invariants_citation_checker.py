@@ -135,6 +135,107 @@ def _combined_doc() -> dict[str, Any]:
                     }
                 ],
             },
+            {
+                # Frame 3 covers V2 strategies: sample-name lookup
+                # (code=6) and the normalized-exprs rung that strips
+                # `EndParenthesis` tokens and surrounding single-quotes
+                # from expr_str before a loose token check.
+                "frame_index": 3,
+                "frame_name": "Frame 3",
+                "event_groups": [
+                    {
+                        "conditions": [
+                            {
+                                # `Random 4 EndParenthesis` is how the
+                                # decompiler renders `Random(4)` in the
+                                # flat expr_str stream — the trailing
+                                # `EndParenthesis` marker replaces `)`.
+                                "num_name": "CompareCounter",
+                                "parameters": [
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "Random 4 EndParenthesis",
+                                    },
+                                    {
+                                        "code": 23,
+                                        "code_name": "EXP2",
+                                        "expr_str": "1",
+                                    },
+                                ],
+                            }
+                        ],
+                        "actions": [
+                            {
+                                # PlayChannelSample shape: code=6 Sample
+                                # param carries the `name` field that
+                                # the Event Parameters decoder pulled
+                                # out of the binary (non-null for every
+                                # code=6 site observed in FNAF 1).
+                                # Paired with a code=22 expression that
+                                # holds the channel number (no bearing
+                                # on the sample-name verifier).
+                                "num_name": "PlayChannelSample",
+                                "parameters": [
+                                    {
+                                        "code": 6,
+                                        "code_name": "SAMPLE",
+                                        "handle": 11,
+                                        "name": "deep steps",
+                                    },
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "1",
+                                    },
+                                ],
+                            },
+                            {
+                                # ExtAction_87 shape: code=45 string
+                                # literal arrives wrapped in single
+                                # quotes (`"'lives'"`) that the tidier
+                                # pseudo drops. Paired with a code=22
+                                # identifier-chain that already matches
+                                # verbatim.
+                                "num_name": "ExtAction_87",
+                                "parameters": [
+                                    {
+                                        "code": 45,
+                                        "code_name": "EXPSTR",
+                                        "expr_str": "'lives'",
+                                    },
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "lives left.CounterValue",
+                                    },
+                                ],
+                            },
+                            {
+                                # Negative-control sample row: code=6
+                                # name that a hostile pseudo might try
+                                # to brush past under a naive substring
+                                # check. Used to prove the sample-name
+                                # verifier is word-boundary guarded.
+                                "num_name": "PlayChannelSample",
+                                "parameters": [
+                                    {
+                                        "code": 6,
+                                        "code_name": "SAMPLE",
+                                        "handle": 99,
+                                        "name": "blip",
+                                    },
+                                    {
+                                        "code": 22,
+                                        "code_name": "EXP",
+                                        "expr_str": "1",
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
         ],
     }
 
@@ -160,7 +261,13 @@ def test_load_combined_keyed_by_four_tuple(combined_json: Path):
     # Frame 2 adds two more action rows (no conditions in that frame).
     assert (2, 0, "action", 0) in combined
     assert (2, 0, "action", 1) in combined
-    assert len(combined) == 6
+    # Frame 3 adds one condition row + three action rows for V2
+    # strategy coverage (sample-name + normalized-exprs).
+    assert (3, 0, "condition", 0) in combined
+    assert (3, 0, "action", 0) in combined
+    assert (3, 0, "action", 1) in combined
+    assert (3, 0, "action", 2) in combined
+    assert len(combined) == 10
 
 
 def test_load_combined_preserves_row_fields(combined_json: Path):
@@ -324,6 +431,238 @@ def test_all_exprs_in_pseudo_rejects_when_one_expr_missing(
         # gate holds.
         pseudo_code="SetChannelVolume(2, something_else)",
         kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
+
+
+def test_normalized_exprs_in_pseudo_strips_endparenthesis(
+    combined_json: Path,
+):
+    """V2 straggler: the decompiler's flat expr_str is
+    `'Random 4 EndParenthesis'` but the tidier pseudo is
+    `Random(4) == 1`. Rung 5 (raw all-exprs) can't match because the
+    whole expr_str isn't present verbatim. Rung 6 fires because
+    `EndParenthesis` triggers the artifact gate, then tokenises to
+    `['Random', '4']` — both standalone tokens in the pseudo, second
+    expr_str `'1'` matches verbatim too."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Fires with 1-in-4 odds.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="condition",
+                cond_or_act_index=0,
+                # pi=None — whole-condition claim.
+            )
+        ],
+        pseudo_code="Random(4) == 1",
+        kind="numeric_comparison",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "normalized_exprs_in_pseudo"
+
+
+def test_normalized_exprs_in_pseudo_strips_surrounding_quotes(
+    combined_json: Path,
+):
+    """ExtAction_87 edge case: code=45 string literal `"'lives'"` is
+    quote-wrapped in the flat rendering but the pseudo mentions
+    `lives` unquoted. Raw all-exprs fails (quotes don't align); rung 6
+    strips the outer quotes, tokenises to `['lives']`, finds it as a
+    standalone word in `lives = lives left.CounterValue`. The second
+    expr_str `lives left.CounterValue` already appears verbatim."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="The 'lives' alterable mirrors the counter.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=1,
+            )
+        ],
+        pseudo_code="lives = lives left.CounterValue",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "normalized_exprs_in_pseudo"
+
+
+def test_normalized_exprs_in_pseudo_requires_artifact_marker(
+    combined_json: Path,
+):
+    """Guard rail: the normalized-exprs rung must NOT fire when every
+    expr_str is clean. A pseudo that merely happens to contain stray
+    word groups from multiple clean expr_strs shouldn't be rubber-
+    stamped — rung 6 only compensates for known decompiler artifacts,
+    not for everything that fails rung 5.
+
+    Frame 2's SetChannelVolume row has expr_strs `'2'` and `'100'`
+    (no `EndParenthesis`, no surrounding quotes). A pseudo that drops
+    the `100` should stay quarantined, proving the artifact gate
+    fires before the loose tokenisation runs.
+    """
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Clean expr_strs, no artifact, loose match must not fire.",
+        citations=[
+            Citation(
+                frame=2,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+            )
+        ],
+        # Pseudo mentions `2` but drops `100` — rung 5 rejects, rung 6
+        # must also reject because no expr_str has an artifact marker.
+        pseudo_code="SetChannelVolume(2, other)",
+        kind="numeric_assignment",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
+
+
+def test_normalized_exprs_in_pseudo_rejects_when_word_missing(
+    combined_json: Path,
+):
+    """Artifact triggers rung 6 but one surviving word is absent from
+    the pseudo → reject. Prevents a pseudo that strips the
+    `EndParenthesis` artifact from squeezing through without actually
+    naming every sub-token of the expression."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Claim omits the literal 4 from the Random call.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="condition",
+                cond_or_act_index=0,
+            )
+        ],
+        # The expr_str is `'Random 4 EndParenthesis'` + `'1'`. After
+        # artifact stripping the words are `['Random', '4']` and `['1']`.
+        # Pseudo drops the `4` — rung 6 must reject.
+        pseudo_code="Random(N) == 1",
+        kind="numeric_comparison",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
+
+
+def test_sample_name_in_pseudo_accepts(combined_json: Path):
+    """V2 Strategy A: the code=6 Sample param carries a decoded `name`
+    field (surfaced directly from the UTF-16 binary). When the pseudo
+    mentions that name as a standalone token, auto-accept with reason
+    `sample_name_in_pseudo`. Covers the `PlayChannelSample` family
+    where code=6 has no expr_str to match against."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Plays the 'deep steps' sample on channel 1.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+                parameter_index=0,
+            )
+        ],
+        pseudo_code="PlayChannelSample(sample='deep steps')",
+        kind="other",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "sample_name_in_pseudo"
+
+
+def test_sample_name_in_pseudo_accepts_without_parameter_index(
+    combined_json: Path,
+):
+    """The sample-name rung must also fire when the citation is
+    whole-action (pi=None). Scans every param on the row, picks the
+    code=6 one, runs the token check against its `name`."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Plays 'deep steps' whenever the scripted trigger fires.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+                # pi=None — whole-action claim.
+            )
+        ],
+        pseudo_code="PlayChannelSample(sample='deep steps')",
+        kind="other",
+    )
+    result = verify_record(combined, rec)
+    assert result.accepted
+    assert result.outcomes[0].reason == "sample_name_in_pseudo"
+
+
+def test_sample_name_in_pseudo_word_boundary_rejects_partial_match(
+    combined_json: Path,
+):
+    """Word-boundary discipline: a sample named `blip` must NOT match
+    inside a pseudo that mentions `blipper`. Without `\\b` guards the
+    verifier would rubber-stamp any hallucinated claim whose sample
+    name is a prefix of a real one — a realistic LM failure mode
+    worth guarding against."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="A 'blipper' sample plays — not the one in the row.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=2,
+                parameter_index=0,
+            )
+        ],
+        # Pseudo mentions `blipper` but the row's code=6 name is `blip`
+        # — word-boundary guard must reject.
+        pseudo_code="PlayChannelSample(sample='blipper')",
+        kind="other",
+    )
+    result = verify_record(combined, rec)
+    assert not result.accepted
+    assert result.outcomes[0].reason == "no_verification_strategy_matched"
+
+
+def test_sample_name_in_pseudo_rejects_when_name_absent(
+    combined_json: Path,
+):
+    """Sanity: when the row carries a code=6 name but the pseudo
+    doesn't mention it at all, fall through to quarantine. This is
+    the bare-miss case the deterministic gate is supposed to catch."""
+    combined = _load_combined(combined_json)
+    rec = InvariantRecord(
+        claim="Plays something unrelated.",
+        citations=[
+            Citation(
+                frame=3,
+                event_group_index=0,
+                type="action",
+                cond_or_act_index=0,
+                parameter_index=0,
+            )
+        ],
+        # Pseudo doesn't mention `deep steps` — no other rung fires
+        # for a code=6 param either, so this falls all the way through.
+        pseudo_code="PlayChannelSample(sample='something_else_entirely')",
+        kind="other",
     )
     result = verify_record(combined, rec)
     assert not result.accepted

@@ -42,16 +42,33 @@ Verification ladder (cheapest → most expensive)
    `parameter_index`) that faithfully summarise the call, like pseudo
    `Ini('beatgame', 0)` against two expression params whose expr_strs
    are `"'beatgame'"` and `'0'`.
-6. **SHORT label match** — for codes 10/26 (SHORT) that carry a
+6. **Normalized-exprs-in-pseudo** (pi=None, artifact-guarded) — when
+   rung 5 fails AND at least one expr_str carries a known decompiler
+   artifact (literal `EndParenthesis` token, or surrounding
+   single-quote wrapping), strip the artifacts, tokenise each expr_str
+   into alphanumeric word groups, and require every surviving word to
+   be a standalone token in the pseudo. Recovers decompiler-mangled
+   expressions like `Random 4 EndParenthesis` against pseudo
+   `Random(4) == 1`, or code=45 quote-wrapped string literals against
+   unquoted pseudo references. Reason:
+   `"normalized_exprs_in_pseudo"`.
+7. **Sample name in pseudo** — for code=6 Sample parameters, the
+   decoded `name` field (surfaced by the Event Parameters decoder
+   straight from the binary) must appear as a standalone token in the
+   record's `pseudo_code`. Reason: `"sample_name_in_pseudo"`. Covers
+   the `PlayChannelSample` / `PlayLoopingChannelSample` family where
+   the sample handle has no expr_str to compare against — the name is
+   the only verifiable content.
+8. **SHORT label match** — for codes 10/26 (SHORT) that carry a
    decoded `label`, if the record's `pseudo_code` quotes the exact
    label, auto-accept with reason `"short_label_match"`.
-7. **Num-name match** — the cited row's `num_name` appears in the
+9. **Num-name match** — the cited row's `num_name` appears in the
    record's `claim` or `pseudo_code`. Weak signal → accept with
    reason `"num_name_match"` only when kind is
    `event_trigger`/`state_transition` (where num_name is the
    operative word), reject otherwise.
-8. **No match** — quarantine with reason
-   `"no_verification_strategy_matched"`.
+10. **No match** — quarantine with reason
+    `"no_verification_strategy_matched"`.
 
 Output files
 ------------
@@ -85,6 +102,30 @@ _EXPRESSION_CODES = frozenset({22, 23, 27, 45})
 # Currently only SHORT codes 10 and 26 — code 50 (AlterableValue) uses
 # the same int16 loader but never carries a label.
 _LABEL_CARRYING_CODES = frozenset({10, 26})
+
+# Parameter codes that carry a decoded `name` field — code 6 Sample
+# parameters surface the sample's UTF-16 name directly from the
+# binary (see `decoders/event_parameters.py::_decode_sample_param`).
+# Gives the `PlayChannelSample` family a verifiable content field even
+# though its code=6 param has no expr_str to compare against.
+_SAMPLE_NAME_CARRYING_CODES = frozenset({6})
+
+# Decompiler artifact tokens that appear in the flat `expr_str`
+# rendering but NOT in the tidier per-record `pseudo_code`.
+#
+# - "endparenthesis": a literal word the decompiler dumps where a
+#   closing `)` would go in the source — e.g. `Random 4 EndParenthesis`
+#   for `Random(4)`. Shows up lowercased by the time we see it because
+#   `_normalise` lowercases before any artifact check.
+#
+# The surrounding-quote case (code=45 string literals wrapped in
+# `'...'`) is handled as a separate strip, not via this set.
+_ENDPAREN_TOKEN = "endparenthesis"
+
+# Punctuation + arithmetic operators the aggressive tokenizer explodes
+# into whitespace so words like `Random` and `20` in the expr_str
+# `'Random (20 + EndParenthesis) 1'` become standalone tokens.
+_DECOMPILER_PUNCT_RE = re.compile(r"[()+\-*/=<>]+")
 
 
 # --- Outcomes -----------------------------------------------------------
@@ -228,6 +269,56 @@ def _expr_str_token_in(expr_str_norm: str, pseudo_norm: str) -> bool:
     return re.search(pattern, pseudo_norm) is not None
 
 
+def _has_decompiler_artifact(expr_str_norm: str) -> bool:
+    """Heuristic gate for the normalized-exprs rung.
+
+    Returns True when the raw expr_str carries a known decompiler
+    artifact that the tidier pseudo omits:
+
+    - A literal `endparenthesis` token somewhere in the string.
+    - Surrounding single-quote wrapping (e.g. `"'lives'"`, a code=45
+      string literal rendered with quotes that the pseudo drops).
+
+    Only when at least one of a row's expr_strs matches this predicate
+    do we permit the looser tokenised-words strategy to fire, keeping
+    the false-accept surface tight.
+    """
+    if _ENDPAREN_TOKEN in expr_str_norm:
+        return True
+    if (
+        len(expr_str_norm) >= 2
+        and expr_str_norm.startswith("'")
+        and expr_str_norm.endswith("'")
+    ):
+        return True
+    return False
+
+
+def _expr_words_for_loose_match(expr_str_norm: str) -> list[str]:
+    """Explode an expr_str into alphanumeric-ish word groups for the
+    normalized-exprs rung.
+
+    Steps, in order:
+
+    1. Strip one layer of surrounding single-quotes if present
+       (`"'lives'"` → `"lives"`). Code=45 string literals arrive
+       wrapped; the pseudo drops the quotes.
+    2. Replace parens + arithmetic operators with whitespace so
+       punctuation-adjacent words in the flat rendering become
+       standalone tokens (`Random(20)` → `Random 20`).
+    3. Split on whitespace, drop empty strings and any token equal to
+       the literal `endparenthesis` decompiler marker.
+
+    Returns the surviving word groups — callers then require each to
+    be a word-boundary-matched token in the pseudo.
+    """
+    s = expr_str_norm
+    if len(s) >= 2 and s.startswith("'") and s.endswith("'"):
+        s = s[1:-1]
+    s = _DECOMPILER_PUNCT_RE.sub(" ", s)
+    return [w for w in s.split() if w and w != _ENDPAREN_TOKEN]
+
+
 # --- Verification strategies --------------------------------------------
 
 
@@ -308,15 +399,97 @@ def _check_expr_str(
     #    unrestricted candidates list — if any expression param is
     #    missing an expr_str (empty/non-string), we can't prove the
     #    pseudo faithfully covers the whole call, so bail.
+    all_exprs_ok = True
+    for p in candidates:
+        if p.get("code") not in _EXPRESSION_CODES:
+            continue
+        expr_str = p.get("expr_str")
+        if not isinstance(expr_str, str) or not expr_str:
+            all_exprs_ok = False
+            break
+        if not _expr_str_token_in(_normalise(expr_str), needle):
+            all_exprs_ok = False
+            break
+    if all_exprs_ok:
+        return "all_exprs_in_pseudo"
+
+    # 4. Normalized-exprs-in-pseudo (pi=None, artifact-guarded). Last
+    #    chance for whole-action claims whose flat expr_str rendering
+    #    carries decompiler artifacts (literal `EndParenthesis`, or
+    #    surrounding quote-wrapping on code=45 string literals) that
+    #    don't appear in the tidier pseudo. Requires at least one
+    #    expr_str to carry an artifact before firing — a clean row
+    #    that fails rung 3 is a genuine mismatch, not artefact noise,
+    #    and should stay in quarantine.
+    any_artifact = False
+    for p in candidates:
+        if p.get("code") not in _EXPRESSION_CODES:
+            continue
+        expr_str = p.get("expr_str")
+        if not isinstance(expr_str, str) or not expr_str:
+            continue
+        if _has_decompiler_artifact(_normalise(expr_str)):
+            any_artifact = True
+            break
+    if not any_artifact:
+        return None
+
     for p in candidates:
         if p.get("code") not in _EXPRESSION_CODES:
             continue
         expr_str = p.get("expr_str")
         if not isinstance(expr_str, str) or not expr_str:
             return None
-        if not _expr_str_token_in(_normalise(expr_str), needle):
+        words = _expr_words_for_loose_match(_normalise(expr_str))
+        if not words:
+            # Entire expr_str was punctuation / endparenthesis tokens,
+            # leaving nothing concrete to verify against.
             return None
-    return "all_exprs_in_pseudo"
+        for w in words:
+            if not _expr_str_token_in(w, needle):
+                return None
+    return "normalized_exprs_in_pseudo"
+
+
+def _check_sample_name(
+    row: dict[str, Any],
+    cit: Citation,
+    record: InvariantRecord,
+) -> str | None:
+    """Return `"sample_name_in_pseudo"` if a code=6 Sample parameter's
+    decoded `name` field appears as a standalone token inside the
+    record's `pseudo_code`.
+
+    Code 6 params have no expr_str — the Event Parameters decoder pulls
+    the UTF-16 name straight from the binary into a `name` field
+    (guaranteed non-empty across FNAF 1's 106 code=6 sites). For claims
+    shaped like `PlayChannelSample(sample='deep steps')` the name IS
+    the verifiable content, and the other codes on the row (22/27 for
+    handle + loop count) don't carry it either. Word-boundary guarded
+    via `_expr_str_token_in` so a name like `blip` doesn't sneak a
+    false accept past a pseudo mentioning `blipper`.
+    """
+    params = row.get("parameters", [])
+    if cit.parameter_index is not None:
+        if cit.parameter_index >= len(params):
+            return None
+        candidates: Iterable[dict[str, Any]] = [params[cit.parameter_index]]
+    else:
+        candidates = params
+
+    pseudo_norm = _normalise(record.pseudo_code)
+    if not pseudo_norm:
+        return None
+
+    for p in candidates:
+        if p.get("code") not in _SAMPLE_NAME_CARRYING_CODES:
+            continue
+        name = p.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if _expr_str_token_in(_normalise(name), pseudo_norm):
+            return "sample_name_in_pseudo"
+    return None
 
 
 def _check_short_label(
@@ -409,6 +582,12 @@ def _check_citation(
     if expr_reason is not None:
         return CitationOutcome(
             citation_index=citation_index, accepted=True, reason=expr_reason
+        )
+
+    sample_reason = _check_sample_name(row, cit, record)
+    if sample_reason is not None:
+        return CitationOutcome(
+            citation_index=citation_index, accepted=True, reason=sample_reason
         )
 
     label_reason = _check_short_label(row, cit, record)
