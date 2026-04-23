@@ -163,11 +163,97 @@ def _require_min(kind: str, data: bytes, needed: int) -> None:
 # --- Fixed-width scalar loaders (codes 10, 25, 26, 50, 14) --------------
 
 
+# Minimum trailing length at which we attempt UTF-16 LE label decode on
+# a Short parameter. Empirically FNAF 1 SHORT bodies (codes 10 and 26)
+# carry 32 bytes of trailing data containing an embedded animation-state
+# label; AlterableValue (code 50) carries only 4 bytes of zero padding
+# that must NOT trip the label decode path. The 16-byte floor sits
+# comfortably between those two regimes and also guards against tiny
+# test-synthetic trailing inputs ("aabbccdd", "dead") being misread as
+# labels.
+_SHORT_LABEL_MIN_TRAILING = 16
+
+
+def _try_decode_utf16_label(data: bytes) -> str | None:
+    """Decode `data` as UTF-16 LE up to the first wide-NUL terminator,
+    or — when the label fills the whole buffer — as the entire body.
+
+    Returns the decoded string iff it is non-empty ASCII-printable text
+    (labels are English FNAF 1 game state names like ``"freddy attack"``,
+    ``"power off"``, ``"animal cam"``, ``"door open"``, ``"closing"``,
+    ``"2nd"``/``"3rd"``/...``"7th"`` night counter). Returns ``None`` on
+    any of:
+
+    - zero-padding only (no codepoint before the wide-NUL)
+    - non-ASCII-printable codepoints (filters out garbage byte patterns
+      that happen to be UTF-16 decodable — e.g. ``0xbbaa`` is a valid
+      Unicode codepoint but not a game-state label)
+
+    Truncated-label contract
+    ------------------------
+    Clickteam reserves a fixed 32-byte slot for the label but does not
+    emit a wide-NUL when the label text fills it exactly (16 UTF-16 LE
+    codepoints). Empirically 23/163 FNAF 1 SHORT labels hit this case
+    (``"stage no chica o"`` truncating ``"stage no chica on cam"``). We
+    fall back to decoding the full buffer when no NUL is found so those
+    labels still surface verbatim.
+    """
+    if len(data) < 4:
+        return None
+    end = len(data) - (len(data) % 2)
+    for i in range(0, end, 2):
+        if data[i] == 0 and data[i + 1] == 0:
+            if i < 2:
+                return None
+            try:
+                s = data[:i].decode("utf-16-le")
+            except UnicodeDecodeError:
+                return None
+            if s and all(32 <= ord(ch) < 127 for ch in s):
+                return s
+            return None
+    # No NUL — buffer-filling truncated label. Decode the whole slot.
+    try:
+        s = data[:end].decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+    if s and all(32 <= ord(ch) < 127 for ch in s):
+        return s
+    return None
+
+
 def _dec_short(data: bytes) -> dict[str, Any]:
-    """Codes 10, 26, 50 — int16 value + trailing pad."""
+    """Codes 10, 26, 50 — int16 value + trailing pad.
+
+    For codes 10 and 26 (SHORT) Clickteam embeds a 32-byte UTF-16 LE
+    animation-state label in the trailing pad. These labels are
+    semantically critical for downstream invariant extraction — they
+    carry the door states (``"door open"`` / ``"closing"``), animatronic
+    positions (``"control room chi[ca]"``, ``"corner 1 bonnie"``,
+    ``"hallway 2"``), jumpscare triggers (``"freddy attack"`` /
+    ``"fox attack"``), power-state transitions (``"power off"``), night
+    counter (``"2nd"`` ... ``"7th"``), and death labels (``"rip"``) that
+    integer values alone don't convey. Empirically 163/163 FNAF 1 SHORT
+    parameters expose a decodable label.
+
+    Code 50 (AlterableValue) uses the same int16 loader but its trailing
+    pad is 4 bytes of zeros — no label surfaces there. The length-based
+    gate (`_SHORT_LABEL_MIN_TRAILING`) keeps test-synthetic trailing
+    (2–4 bytes) out of the label path too.
+    """
     _require_min("Short", data, 2)
     (value,) = struct.unpack_from("<h", data, 0)
-    return {"kind": "Short", "value": value, "trailing_hex": _trailing(data, 2)}
+    result: dict[str, Any] = {
+        "kind": "Short",
+        "value": value,
+        "trailing_hex": _trailing(data, 2),
+    }
+    trailing = data[2:]
+    if len(trailing) >= _SHORT_LABEL_MIN_TRAILING:
+        label = _try_decode_utf16_label(trailing)
+        if label is not None:
+            result["label"] = label
+    return result
 
 
 def _dec_int(data: bytes) -> dict[str, Any]:

@@ -77,6 +77,55 @@ class TestShortInt:
         with pytest.raises(EventParameterDecodeError, match=">= 2 bytes"):
             decode_event_parameter(code, b"\x00", unicode=True)
 
+    @pytest.mark.parametrize("code", [10, 26])
+    def test_short_label_nul_terminated(self, code: int) -> None:
+        """Codes 10/26 surface the 32-byte UTF-16 LE animation-state
+        label when it's shorter than the buffer (NUL-terminated)."""
+        label = "freddy attack"
+        label_bytes = label.encode("utf-16-le") + b"\x00\x00"
+        pad = b"\x00" * (32 - len(label_bytes))
+        data = struct.pack("<h", 3) + label_bytes + pad
+        out = decode_event_parameter(code, data, unicode=True)
+        assert out["value"] == 3
+        assert out["label"] == label
+
+    @pytest.mark.parametrize("code", [10, 26])
+    def test_short_label_buffer_filling(self, code: int) -> None:
+        """Codes 10/26 surface a buffer-filling label (no wide-NUL)
+        when the label fills all 16 UTF-16 LE slots. Empirically
+        Clickteam truncates long labels this way — 23/163 FNAF 1 SHORT
+        labels hit this case (e.g. `"stage no chica o"`)."""
+        label = "stage no chica o"  # exactly 16 chars → 32 bytes UTF-16 LE
+        data = struct.pack("<h", 1) + label.encode("utf-16-le")
+        out = decode_event_parameter(code, data, unicode=True)
+        assert out["label"] == label
+
+    @pytest.mark.parametrize("code", [10, 26, 50])
+    def test_short_label_absent_on_zero_pad(self, code: int) -> None:
+        """All-zero trailing of any length yields no `label` field."""
+        data = struct.pack("<h", 0) + b"\x00" * 32
+        out = decode_event_parameter(code, data, unicode=True)
+        assert "label" not in out
+
+    @pytest.mark.parametrize("code", [10, 26, 50])
+    def test_short_label_absent_on_short_trailing(self, code: int) -> None:
+        """Trailing shorter than the 16-byte label floor is ignored —
+        guards regression from tiny test-synthetic inputs like
+        `b"\\xAA\\xBB\\xCC\\xDD"` being misread as labels."""
+        data = struct.pack("<h", 42) + b"\xAA\xBB\xCC\xDD"
+        out = decode_event_parameter(code, data, unicode=True)
+        assert "label" not in out
+        assert out["trailing_hex"] == "aabbccdd"
+
+    def test_short_label_absent_on_non_ascii(self) -> None:
+        """Non-ASCII-printable trailing (garbage bytes that happen to
+        UTF-16-decode) is NOT surfaced as a label."""
+        # 0xBBAA 0xDDCC ... — valid Unicode codepoints but not printable
+        # ASCII — so the label gate rejects them.
+        data = struct.pack("<h", 5) + b"\xAA\xBB\xCC\xDD" * 8
+        out = decode_event_parameter(10, data, unicode=True)
+        assert "label" not in out
+
     def test_int_value(self) -> None:
         out = decode_event_parameter(25, struct.pack("<i", 1_000_000), unicode=True)
         assert out == {
