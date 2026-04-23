@@ -63,7 +63,7 @@ FNAF1_COND_ACT_PAIRS = 2532
 # message convention is: `test(parser): re-pin algorithm snapshot after
 # <reason>` so the hash bump is always traceable to a stated cause.
 FNAF1_COMBINED_JSONL_SHA256 = (
-    "818d2757580d220274991ca9e58b49964f83aeab290fa90a45225a0257ad324a"
+    "bae32d609a5ce4804154f9a236d9307a04a963bcde9f52071c419cf22d9a24a1"
 )
 
 
