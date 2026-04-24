@@ -97,15 +97,19 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# Phase 4: COVERAGE ANTIBODY — on accepted.jsonl (post-citation-check).
+# Phase 4: COVERAGE ANTIBODY — on extracted.jsonl (pre-checker).
+# Measures extract-time breadth against combined.jsonl. Pointing coverage
+# at the raw extract (not post-citation-checker accepted.jsonl) catches
+# gaps in the extractor itself and decouples this phase from phase 3's
+# exit status.
 # -----------------------------------------------------------------------
 log "--- PHASE 4: COVERAGE ---"
-if [ ! -f "out/invariants/accepted.jsonl" ]; then
-  log "SKIP coverage: accepted.jsonl missing"
+if [ ! -f "out/invariants/extracted.jsonl" ]; then
+  log "SKIP coverage: extracted.jsonl missing"
 else
   uv run python -m fnaf_parser.invariants.coverage \
     --combined out/algorithm/combined.jsonl \
-    --input out/invariants/accepted.jsonl \
+    --input out/invariants/extracted.jsonl \
     --report out/invariants/coverage_report.json \
     2>&1 | tee "$LOG_DIR/coverage.log"
   COVERAGE_EXIT=${PIPESTATUS[0]}
@@ -114,13 +118,16 @@ fi
 
 # -----------------------------------------------------------------------
 # Phase 5: LITERAL GATE — Layer 1 free, Layer 2 judge with light parallelism.
+# Runs against extracted.jsonl (flat shape). Citation_checker's
+# wrapped accepted.jsonl would feed the gate empty strings via the
+# missing-claim silent-pass bug session-11 caught and fixed.
 # -----------------------------------------------------------------------
 log "--- PHASE 5: LITERAL GATE ---"
-if [ ! -f "out/invariants/accepted.jsonl" ]; then
-  log "SKIP literal_gate: accepted.jsonl missing"
+if [ ! -f "out/invariants/extracted.jsonl" ]; then
+  log "SKIP literal_gate: extracted.jsonl missing"
 else
   uv run python -m fnaf_parser.invariants.literal_gate \
-    --extracted out/invariants/accepted.jsonl \
+    --extracted out/invariants/extracted.jsonl \
     --combined out/algorithm/combined.jsonl \
     --out out/invariants \
     --max-workers 5 \

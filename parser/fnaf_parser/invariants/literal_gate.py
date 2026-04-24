@@ -41,14 +41,16 @@ edit without re-running probe 0.7 or a superseding test.
 Output
 ------
 
-  <out_dir>/accepted.jsonl        — records that passed both layers
+  <out_dir>/accepted_gate.jsonl   — records that passed both layers
   <out_dir>/quarantine_gate.jsonl — records that failed Layer 1 and/or
                                     Layer 2, with reasons
 
-Separate from citation_checker's `accepted.jsonl` / `quarantine.jsonl`
-by design — the two gates check orthogonal properties (structural vs.
-semantic-literal) and quarantining from either side is informative on
-its own.
+The `_gate` suffix keeps literal_gate's outputs disjoint from
+citation_checker's `accepted.jsonl` / `quarantine.jsonl`. The two
+gates check orthogonal properties (structural vs. semantic-literal);
+they land in the same directory and must not clobber each other.
+Session-11 surfaced the original filename collision the first time
+run_step5.sh chained both into one out_dir.
 
 Exit codes
 ----------
@@ -237,8 +239,19 @@ def layer1_verdict(
     Pass iff:
       - no forbidden-word hits
       - role-word hits <= role_budget  (default 2; handoff spec)
+
+    Raises KeyError on records missing a top-level `claim`. Session-11
+    dug up a silent-vacuous-pass bug: `record.get("claim", "")` let the
+    citation_checker wrapped shape (`{"record": {...}, ...}`) trivially
+    pass Layer 1 by scanning the empty string. Fail loud instead.
     """
-    claim = str(record.get("claim", ""))
+    if "claim" not in record:
+        raise KeyError(
+            "literal_gate expects flat extract.py record shape with a "
+            "top-level 'claim' key; got record with keys "
+            f"{sorted(record.keys())!r}"
+        )
+    claim = str(record["claim"])
     scan = scan_text(claim, effective_role_words, effective_forbidden_words)
     forbidden_any = scan["total_forbidden_hits"] > 0
     role_exceeds = scan["total_role_hits"] > role_budget
@@ -448,7 +461,7 @@ def run(
 
     # --- Write outputs ---
     out_dir.mkdir(parents=True, exist_ok=True)
-    accepted_path = out_dir / "accepted.jsonl"
+    accepted_path = out_dir / "accepted_gate.jsonl"
     quarantine_path = out_dir / "quarantine_gate.jsonl"
     with accepted_path.open("w", encoding="utf-8") as fh:
         for r in accepted:
