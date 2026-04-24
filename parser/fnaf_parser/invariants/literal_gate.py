@@ -30,9 +30,36 @@ compound like `power left`) and would have blinded the gate to genuine
   word-in-compound match.
 
 Tree node Literal Until Proven (session-10 append) carries the full
-spec and the "why". This module IS the production implementation of
-that spec. Probe 0.8's `build_vocab_words` + `word-in-vocab_words`
-check is the known-buggy approach and is deliberately NOT lifted.
+spec and the "why". Probe 0.8's `build_vocab_words` +
+`word-in-vocab_words` check is the known-buggy approach and is
+deliberately NOT lifted.
+
+Session-14 refinement — compound-vocab mask pre-pass
+----------------------------------------------------
+
+Session-10 alone still blocks literal compound names that mention a
+role-word (e.g. the 31 quarantine records whose `claim` cites objects
+like `'power left'` / `'power left 2'` / `'power down'` / `'power
+off'`). The single-word `power` stays in the role list because `power`
+is not itself a standalone vocab phrase, so the raw-claim scan
+catches `\bpower\b` inside the compound.
+
+Probe 3 (session 14) validated the fix: build a BROAD compound vocab
+from every multi-word string-valued leaf anywhere in combined.jsonl
+(not only `object_name`/`num_name`; recursive walk across all fields
+including `parameters`, `expr_str`, `label`, `name`). Pre-mask the
+claim text longest-first before the role-word regex scan.
+
+Coverage: 31/31 power-cluster records catch; mask shapes that absorb
+`\bpower\b` are exactly `power down` / `power left` / `power left 2` /
+`power off` — all literal MFA identifiers. Regression on 538 existing
+accepted records: zero (accepted set contains no standalone role-word
+to be eaten).
+
+Self-growing property: the compound vocab is a function of
+combined.jsonl; schema growth extends vocab with zero code change.
+This is the "Option 1 self-growing vocab-mask" antibody on Literal
+Until Proven.
 
 Layer 2 judge prompt is lifted verbatim from
 `parser/temp-probes/probe_0_7_gate.py` (10/10 after tuning). Do NOT
@@ -169,6 +196,67 @@ def build_vocab_phrases(combined_rows: Iterable[dict]) -> frozenset[str]:
     return frozenset(phrases)
 
 
+# Non-role sentinel used by mask_claim. NUL bytes never appear in MFA
+# strings, so this cannot collide with a legitimate vocab phrase.
+_MASK_TOKEN = " \x00mask\x00 "
+
+
+def build_compound_vocab_mask(combined_rows: Iterable[dict]) -> frozenset[str]:
+    """Collect every multi-word string-valued leaf from combined_rows.
+
+    Recursive walk across all nested dict/list structure — captures
+    `object_name`, `num_name`, `parameters[].name`, `parameters[].label`,
+    `parameters[].expr_str`, and anything else the MFA schema grows.
+    Only multi-word strings (containing a space after strip) are kept;
+    single-word vocab is handled by `build_vocab_phrases` + the
+    standalone-subtraction path in `filter_role_words`.
+
+    Session-14 (Probe 3) antibody: self-growing vocab-mask. Option 1 on
+    the Literal Until Proven antibody library. Catches 31/31 of the
+    session-13 power-cluster quarantine records. Zero hand-curation.
+    """
+    phrases: set[str] = set()
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+        elif isinstance(obj, str):
+            s = obj.strip().lower()
+            if s and " " in s:
+                phrases.add(s)
+
+    for row in combined_rows:
+        walk(row)
+    return frozenset(phrases)
+
+
+def mask_claim(claim: str, compound_vocab: frozenset[str]) -> tuple[str, list[str]]:
+    """Replace every compound-vocab phrase in claim with `_MASK_TOKEN`.
+
+    Longest-first to avoid prefix consumption: if both `power left` and
+    `power left 2` live in vocab, masking `power left` first would
+    rewrite `power left 2` to `<MASK> 2`, hiding the longer literal and
+    leaving a residual digit token.
+
+    Returns `(masked_lowercase_claim, mask_hits)`. `mask_hits` is the
+    list of vocab phrases that actually fired on this claim — useful
+    for audit and antibody tuning.
+    """
+    lowered = claim.lower()
+    hits: list[str] = []
+    if not compound_vocab:
+        return lowered, hits
+    for phrase in sorted(compound_vocab, key=lambda p: (-len(p), p)):
+        if phrase in lowered:
+            hits.append(phrase)
+            lowered = lowered.replace(phrase, _MASK_TOKEN)
+    return lowered, hits
+
+
 def filter_role_words(
     seed: list[str],
     vocab_phrases: frozenset[str],
@@ -200,14 +288,23 @@ def scan_text(
     role_words: list[str],
     forbidden_words: list[str],
     grace_words: list[str] = GRACE_WORDS,
+    compound_vocab: frozenset[str] = frozenset(),
 ) -> dict:
     """Word-boundary scan of `text` for role / forbidden / grace words.
 
+    When `compound_vocab` is non-empty (session-14 mask pre-pass), every
+    multi-word vocab phrase is replaced with a non-role sentinel before
+    the regex scan runs. This absorbs literal compound identifiers like
+    `power left` / `power left 2` so the `\\bpower\\b` scan does not
+    false-flag role inference on a literal MFA object reference.
+
     Returns a dict describing hit counts per category. `forbidden_hits`
     is a strict subset of `role_hits` — every forbidden is also a
-    role, but not every role is forbidden.
+    role, but not every role is forbidden. `mask_hits` lists the vocab
+    phrases that fired on this claim (empty list when the mask pass is
+    skipped).
     """
-    lowered = text.lower()
+    lowered, mask_hits = mask_claim(text, compound_vocab)
     role_hits: dict[str, int] = {}
     for word in role_words:
         matches = re.findall(r"\b" + re.escape(word) + r"\b", lowered)
@@ -225,6 +322,7 @@ def scan_text(
         "grace_hits": grace_hits,
         "total_role_hits": sum(role_hits.values()),
         "total_forbidden_hits": sum(forbidden_hits.values()),
+        "mask_hits": mask_hits,
     }
 
 
@@ -233,12 +331,18 @@ def layer1_verdict(
     effective_role_words: list[str],
     effective_forbidden_words: list[str],
     role_budget: int,
+    compound_vocab: frozenset[str] = frozenset(),
 ) -> dict:
     """Run Layer 1 against one record's `claim`.
 
     Pass iff:
       - no forbidden-word hits
       - role-word hits <= role_budget  (default 2; handoff spec)
+
+    When `compound_vocab` is non-empty, the claim is pre-masked by
+    `mask_claim` (session-14 antibody) before the role/forbidden regex
+    scan. Default empty for backward compatibility with session-10
+    callers and unit tests that only exercise the raw scan.
 
     Raises KeyError on records missing a top-level `claim`. Session-11
     dug up a silent-vacuous-pass bug: `record.get("claim", "")` let the
@@ -252,7 +356,12 @@ def layer1_verdict(
             f"{sorted(record.keys())!r}"
         )
     claim = str(record["claim"])
-    scan = scan_text(claim, effective_role_words, effective_forbidden_words)
+    scan = scan_text(
+        claim,
+        effective_role_words,
+        effective_forbidden_words,
+        compound_vocab=compound_vocab,
+    )
     forbidden_any = scan["total_forbidden_hits"] > 0
     role_exceeds = scan["total_role_hits"] > role_budget
     passed = not forbidden_any and not role_exceeds
@@ -393,6 +502,7 @@ def run(
         if line.strip()
     ]
     vocab_phrases = build_vocab_phrases(combined_rows)
+    compound_vocab = build_compound_vocab_mask(combined_rows)
     role_kept, role_subtracted = filter_role_words(ROLE_WORDS_SEED, vocab_phrases)
     forbidden_kept, forbidden_subtracted = filter_role_words(
         FORBIDDEN_WORDS_SEED, vocab_phrases
@@ -410,6 +520,8 @@ def run(
     print("=" * 68)
     print(f"records:           {len(records):,}")
     print(f"vocab_phrases:     {len(vocab_phrases):,}  (standalone-literal set)")
+    print(f"compound_vocab:    {len(compound_vocab):,}  "
+          f"(session-14 mask pre-pass, multi-word all-fields)")
     print(f"role_words kept:   {len(role_kept):>2} / {len(ROLE_WORDS_SEED)}  "
           f"subtracted: {role_subtracted}")
     print(f"forbidden kept:    {len(forbidden_kept):>2} / {len(FORBIDDEN_WORDS_SEED)}  "
@@ -421,7 +533,9 @@ def run(
     # --- Layer 1 pass ---
     layer1_results: list[dict] = []
     for rec in records:
-        v = layer1_verdict(rec, role_kept, forbidden_kept, role_budget)
+        v = layer1_verdict(
+            rec, role_kept, forbidden_kept, role_budget, compound_vocab
+        )
         layer1_results.append({"record": rec, "layer1": v})
     layer1_pass = [r for r in layer1_results if r["layer1"]["passed"]]
     layer1_fail = [r for r in layer1_results if not r["layer1"]["passed"]]

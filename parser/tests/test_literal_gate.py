@@ -15,8 +15,10 @@ from __future__ import annotations
 import pytest
 
 from fnaf_parser.invariants.literal_gate import (
+    build_compound_vocab_mask,
     filter_role_words,
     layer1_verdict,
+    mask_claim,
 )
 
 
@@ -147,3 +149,133 @@ def test_filter_role_words_multi_word_substring_match():
     vocab = frozenset(["left door open", "office"])
     kept, subtracted = filter_role_words(["left door"], vocab)
     assert "left door" in subtracted
+
+
+# --- Session-14 refinement: compound-vocab mask pre-pass ------------------
+
+
+def test_build_compound_vocab_mask_walks_nested_structure():
+    """Recursive walk must pick up multi-word strings from every level
+    of the record — not just top-level `object_name` / `num_name`.
+    """
+    rows = [
+        {
+            "object_name": "power left",  # multi-word
+            "num_name": "CompareCounter",  # single-word, skip
+            "parameters": [
+                {"name": "powerdown", "label": "power off"},  # multi in label
+                {"expr_str": "power left.CounterValue <= 10"},
+            ],
+        },
+        {
+            "object_name": "freddy bear",
+            "parameters": [
+                {"label": "  "},  # whitespace-only after strip, skip
+                {"label": "darkness music"},
+            ],
+        },
+    ]
+    vocab = build_compound_vocab_mask(rows)
+    assert "power left" in vocab
+    assert "power off" in vocab
+    assert "power left.countervalue <= 10" in vocab
+    assert "freddy bear" in vocab
+    assert "darkness music" in vocab
+    # Single-word strings are skipped; so is whitespace-only.
+    assert "comparecounter" not in vocab
+    assert "powerdown" not in vocab
+    assert "" not in vocab
+
+
+def test_mask_claim_empty_vocab_is_identity_lowercase():
+    """Empty compound vocab => lowercase claim, no hits. Backward-compat
+    path for unit tests and session-10 callers that pre-date the mask.
+    """
+    masked, hits = mask_claim("When POWER drops, Freddy scares.", frozenset())
+    assert masked == "when power drops, freddy scares."
+    assert hits == []
+
+
+def test_mask_claim_absorbs_literal_compound():
+    """`power` inside the literal compound `power left` must be masked,
+    so a downstream `\\bpower\\b` scan sees no role-word hit.
+    """
+    vocab = frozenset(["power left", "power left 2", "freddy bear"])
+    claim = (
+        "When counter 'power left' < 0, "
+        "set counter 'power left' to 0 and counter 'power left 2' to 0."
+    )
+    masked, hits = mask_claim(claim, vocab)
+    # Original role-word is gone.
+    import re as _re
+    assert not _re.search(r"\bpower\b", masked)
+    # Both literal compounds fired.
+    assert "power left" in hits
+    assert "power left 2" in hits
+
+
+def test_mask_claim_longest_first_prevents_prefix_consumption():
+    """If `power left` masks before `power left 2`, the longer literal
+    is partially rewritten and never matches. Longest-first ordering
+    guarantees the full identifier is absorbed first.
+    """
+    vocab = frozenset(["power left", "power left 2"])
+    claim = "counter 'power left 2' was set."
+    masked, hits = mask_claim(claim, vocab)
+    # The longer phrase must land in hits — if prefix-consumption won,
+    # we'd see only the shorter phrase followed by a residual ' 2'.
+    assert "power left 2" in hits
+
+
+def test_layer1_verdict_compound_vocab_unblocks_literal_power_compound():
+    """Session-14 end-to-end: claim that references literal MFA object
+    `power left` must pass Layer 1 when compound_vocab includes that
+    phrase. Without the mask (session-10 behavior) it would fail on
+    `\\bpower\\b`.
+    """
+    record = {
+        "claim": (
+            "When counter 'power left' < 0, "
+            "set counter 'power left' to 0."
+        ),
+    }
+    vocab = frozenset(["power left"])
+    # Without mask: fails on power role-word.
+    v_before = layer1_verdict(
+        record,
+        effective_role_words=["power"],
+        effective_forbidden_words=["power"],
+        role_budget=2,
+    )
+    assert v_before["passed"] is False
+    # With mask: passes, and mask_hits records the absorbing phrase.
+    v_after = layer1_verdict(
+        record,
+        effective_role_words=["power"],
+        effective_forbidden_words=["power"],
+        role_budget=2,
+        compound_vocab=vocab,
+    )
+    assert v_after["passed"] is True
+    assert v_after["reason"] == "layer1_pass"
+    assert "power left" in v_after["scan"]["mask_hits"]
+
+
+def test_layer1_verdict_compound_vocab_does_not_rescue_pure_role_claim():
+    """Mask only absorbs literal compounds. A claim that uses `power`
+    standalone (no matching vocab phrase) must still fail, regardless
+    of how rich compound_vocab is elsewhere.
+    """
+    record = {
+        "claim": "When power drops, Freddy triggers a jumpscare.",
+    }
+    vocab = frozenset(["power left", "power left 2", "freddy bear"])
+    v = layer1_verdict(
+        record,
+        effective_role_words=["power", "jumpscare"],
+        effective_forbidden_words=["power", "jumpscare"],
+        role_budget=2,
+        compound_vocab=vocab,
+    )
+    assert v["passed"] is False
+    assert "forbidden_hits" in v["reason"]
