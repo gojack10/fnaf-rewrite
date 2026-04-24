@@ -4,7 +4,7 @@ Consumes the dict outputs of `decoders.frame_events` and
 `decoders.event_parameters` and injects `*_name` fields alongside every
 resolvable numeric ID. Every unknown ID raises `NameResolutionError` so
 missing Name Tables entries are caught *before* they silently corrupt
-downstream LLM invariant extraction.
+downstream consumers (the Rust runtime rebuild).
 
 Scope ([[Name Resolver|c010e0f4-b420-4bbb-ad32-ee8ab0c0c7da]]):
 

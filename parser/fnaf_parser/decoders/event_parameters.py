@@ -227,7 +227,7 @@ def _dec_short(data: bytes) -> dict[str, Any]:
 
     For codes 10 and 26 (SHORT) Clickteam embeds a 32-byte UTF-16 LE
     animation-state label in the trailing pad. These labels are
-    semantically critical for downstream invariant extraction — they
+    semantically critical for downstream consumers — they
     carry the door states (``"door open"`` / ``"closing"``), animatronic
     positions (``"control room chi[ca]"``, ``"corner 1 bonnie"``,
     ``"hallway 2"``), jumpscare triggers (``"freddy attack"`` /

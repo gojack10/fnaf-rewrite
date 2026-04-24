@@ -8,8 +8,8 @@ here either
       a path-qualified message — on any unknown ID.
 
 The loud-failure contract is the whole reason this layer exists: a
-silent fallback would let Name Tables gaps silently corrupt the LLM
-invariant extractor downstream. We pin it here so a well-meaning
+silent fallback would let Name Tables gaps silently corrupt downstream
+consumers (the Rust runtime rebuild). We pin it here so a well-meaning
 "just add a default" refactor fails immediately.
 
 Shape pins

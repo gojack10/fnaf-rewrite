@@ -34,11 +34,6 @@ def test_build_parser_exposes_three_subcommands():
     If a future work unit adds a fourth subcommand, update this list
     deliberately — silently widening the CLI surface is the kind of
     drift the Parity Maintenance habit is meant to catch.
-
-    Note: `extract-invariants` was removed in the session-10 cleanup
-    alongside the discarded DSPy.RLM scaffolding. Invariant extraction
-    now lives in `fnaf_parser.invariants.extract` and is invoked via
-    `python -m` rather than through argparse.
     """
     parser = build_parser()
     subparsers_action = next(

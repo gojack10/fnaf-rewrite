@@ -5,15 +5,11 @@ description = "FNAF 1 Clickteam data-pack parser"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dspy>=3.2.0",
     "duckdb>=1.5.2",
     # numpy is used directly by `fnaf_parser.decoders.images_pixels` for
     # vectorised BGR→RGBA pixel decoding (tested in
-    # `tests/test_images_pixels.py`). It was available transitively via
-    # dspy before the vectorisation, but the production decoder imports
-    # it directly now, so declare it here.
+    # `tests/test_images_pixels.py`).
     "numpy>=2.0",
-    "pydantic>=2.9.0",
     "pytest>=9.0.3",
     "rich>=15.0.0",
 ]

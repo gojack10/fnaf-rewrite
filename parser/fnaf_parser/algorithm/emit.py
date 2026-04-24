@@ -70,8 +70,8 @@ _CHUNK_ID_FRAME = 0x3333
 _OBJECT_INFO_NO_TARGET: int = 0xFFFF
 
 #: Semantic version of this decoder. Surfaced in `manifest.json` so
-#: downstream tooling (Algorithm Snapshot Antibody, LLM-driven invariant
-#: extraction) can gate on the shape. Bump on any wire-level change to
+#: downstream tooling (Algorithm Snapshot Antibody, the Rust runtime
+#: rebuild) can gate on the shape. Bump on any wire-level change to
 #: the emitted schema.
 DECODER_VERSION: str = "0.1.0"
 

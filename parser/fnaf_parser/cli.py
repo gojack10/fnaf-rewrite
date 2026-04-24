@@ -31,12 +31,6 @@ CLI Scaffolding replaces that with a proper argparse tree:
         action per line) + `manifest.json` (navigation index with
         SHA-256 hashes).
 
-Note: the `extract-invariants` subcommand was removed in the session-10
-cleanup alongside the discarded DSPy.RLM pipeline. Invariant extraction
-now lives in `fnaf_parser.invariants.extract` and is invoked directly
-(`uv run python -m fnaf_parser.invariants.extract ...`) rather than
-through this argparse tree.
-
 Env-var compatibility
 ---------------------
 

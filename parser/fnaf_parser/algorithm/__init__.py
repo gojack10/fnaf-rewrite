@@ -1,9 +1,9 @@
 """Algorithm-extraction package — `dump-algorithm` pipeline home.
 
 This subpackage houses the work that turns the parser's decoded event
-data into a machine-readable JSON / JSONL spec for downstream LLM
-invariant extraction. Scope is split across the Algorithm Extraction
-work units:
+data into a machine-readable JSON / JSONL spec for downstream
+consumers (the Rust runtime rebuild). Scope is split across the
+Algorithm Extraction work units:
 
 - **CLI Scaffolding** (this module's reason for existing) — argparse
   wires `fnaf-parser dump-algorithm` into `emit.dump_algorithm`, which
