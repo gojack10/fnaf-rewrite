@@ -30,8 +30,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from fnaf_parser.invariants.citation_checker import check_records
-from fnaf_parser.invariants.signatures import InvariantRecord
+from fnaf_parser.invariants.citation_checker import (
+    InvariantRecord,
+    check_records,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
