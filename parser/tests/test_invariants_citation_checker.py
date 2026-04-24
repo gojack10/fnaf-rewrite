@@ -15,11 +15,12 @@ from typing import Any
 import pytest
 
 from fnaf_parser.invariants.citation_checker import (
+    Citation,
+    InvariantRecord,
     _load_combined,
     check_records,
     verify_record,
 )
-from fnaf_parser.invariants.signatures import Citation, InvariantRecord
 
 
 # --- Fixture builder ----------------------------------------------------

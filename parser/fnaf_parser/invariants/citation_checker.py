@@ -88,9 +88,68 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
-from fnaf_parser.invariants.signatures import Citation, InvariantRecord
+from pydantic import BaseModel, Field, field_validator
+
+
+# --- Record schema ------------------------------------------------------
+#
+# Moved here from the deleted `signatures.py` during session-10 cleanup.
+# Kept self-contained so citation_checker has no downstream dependency on
+# the extractor. The extractor (`extract.py`) keeps its own inline copy
+# of the same schema — same invariants, enforced in both producer and
+# consumer by construction.
+#
+# Two load-bearing invariants pinned on the Citation Checker tree node
+# (session-10-prep append):
+#   1. Citations are a 5-TUPLE. `type` is required because
+#      cond_or_act_index is type-scoped within an event_group:
+#      conditions index from 0 AND actions index from 0, independently.
+#      Dropping `type` makes `cond_or_act_index=2` ambiguous.
+#   2. `claim` and `pseudo_code` are whitespace-stripped at construction.
+#      Without this, prompt-echo newlines/spaces tank expr_str_match's
+#      _normalise(pseudo) in _normalise(expr_str) check.
+
+
+class Citation(BaseModel):
+    """Pointer into `combined.json` / `combined.jsonl`.
+
+    The 5-tuple (frame, event_group_index, type, cond_or_act_index,
+    parameter_index?) uniquely identifies one parameter within one row
+    within one group within one frame. `type` disambiguates whether
+    `cond_or_act_index` indexes into `conditions[]` or `actions[]`.
+    """
+
+    frame: int = Field(ge=0)
+    event_group_index: int = Field(ge=0)
+    type: Literal["condition", "action"]
+    cond_or_act_index: int = Field(ge=0)
+    parameter_index: int | None = Field(default=None, ge=0)
+
+
+class InvariantRecord(BaseModel):
+    """One machine-checkable invariant claim with grounded citations."""
+
+    claim: str = Field(min_length=4)
+    citations: list[Citation] = Field(min_length=1)
+    pseudo_code: str = Field(min_length=1)
+    kind: Literal[
+        "numeric_assignment",
+        "numeric_comparison",
+        "state_transition",
+        "event_trigger",
+        "other",
+    ]
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @field_validator("claim", "pseudo_code")
+    @classmethod
+    def _strip_whitespace(cls, v: str) -> str:
+        """Trim leading/trailing whitespace so prompt-echo padding doesn't
+        sink downstream string-match verification."""
+        return v.strip()
+
 
 # --- Constants ----------------------------------------------------------
 
