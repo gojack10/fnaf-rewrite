@@ -252,6 +252,21 @@ def _build_lm_for_model(cfg: OpenRouterConfig, model_slug: str):  # type: ignore
         The head chef sees the same cap because its output (filtered
         `list[InvariantRecord]`) is bounded above by the line cook's
         output — it can only shrink the set, never grow it.
+
+    `timeout=180`
+        Hard ceiling (seconds) on any single HTTP call to OpenRouter.
+        Passed through to litellm / httpx. Without this, httpx defaults
+        to unbounded read, and a single hung streaming response from
+        a slow reasoning-class model (observed in the wild with
+        GLM 5.1 on the head-chef seat) stalls the entire pipeline —
+        no retry, no error, just a silent `do_sys_poll` forever.
+
+        180s is generous enough that productive-but-slow responses
+        (15k reasoning + emission tokens on GLM 5.1) still complete,
+        but bounded enough that hangs cost us three minutes, not
+        hours. Litellm raises `Timeout` on expiry; DSPy's LM wrapper
+        retries per its own `num_retries` default, so a single
+        stuck response doesn't kill the whole run.
     """
     import dspy  # noqa: PLC0415  (lazy; keeps dspy off import-time path)
 
@@ -261,6 +276,7 @@ def _build_lm_for_model(cfg: OpenRouterConfig, model_slug: str):  # type: ignore
         api_base=cfg.api_base,
         temperature=0.0,
         max_tokens=16384,
+        timeout=180,
     )
 
 
