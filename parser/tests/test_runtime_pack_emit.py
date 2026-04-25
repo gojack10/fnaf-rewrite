@@ -73,6 +73,10 @@ FNAF1_COUNTER_TOTAL_HANDLE_REFS = 607
 FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES = 201
 FNAF1_BACKDROP_COUNT = 15
 FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES = 15
+FNAF1_TEXT_COUNT = 10
+FNAF1_TEXT_TOTAL_CHARS = (
+    84 + 7 + 4 + 21 + 5 + 10 + 9 + 46 + 1 + 167
+)  # = 354 — sum of every Text body's char_count, pinned to the probe ship-log
 
 
 # --- Fixture ------------------------------------------------------------
@@ -233,6 +237,16 @@ def test_antibody_counts_are_self_consistent(_pack_out: Path) -> None:
     assert counts["backdrop_unique_image_handles"] == (
         FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES
     )
+    assert counts["text_objects"] == FNAF1_TEXT_COUNT
+    assert counts["text_decoded_objects"] == FNAF1_TEXT_COUNT
+    assert counts["text_total_chars"] == FNAF1_TEXT_TOTAL_CHARS
+    # Font-handle uniqueness: every observed Text in FNAF 1 carries a
+    # decoded font_handle; we don't pin the cardinality (a future text
+    # might add a new font), but we DO pin the lower bound — at least
+    # one font is in use, and every decoded text contributed exactly
+    # one font handle to the unique set.
+    assert counts["text_unique_font_handles"] >= 1
+    assert counts["text_unique_font_handles"] <= FNAF1_TEXT_COUNT
 
     # Cross-check counts against the files list
     png_count = sum(1 for k in files if k.endswith(".png"))
@@ -282,10 +296,16 @@ def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None
         for obj in object_bank["objects"]
         if obj["object_type_name"] == "Backdrop"
     ]
+    text = [
+        obj
+        for obj in object_bank["objects"]
+        if obj["object_type_name"] == "Text"
+    ]
     other = [
         obj
         for obj in object_bank["objects"]
-        if obj["object_type_name"] not in {"Active", "Counter", "Backdrop"}
+        if obj["object_type_name"]
+        not in {"Active", "Counter", "Backdrop", "Text"}
     ]
     assert len(active) == FNAF1_ACTIVE_COUNT
     assert all(obj["properties_decoded"] is True for obj in active)
@@ -307,7 +327,20 @@ def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None
     assert all(obj["properties_summary"] is not None for obj in backdrop)
     assert all(obj["animations"] is None for obj in backdrop)
 
-    # Text / Extension still stay raw in V0. The Rust pack_probe's
+    # Texts now decode through `decode_text_body`. They carry
+    # `properties_summary` (font handle / flags / color / value + box
+    # dims) but NOT `animations` — that field stays Active-only.
+    assert len(text) == FNAF1_TEXT_COUNT
+    assert all(obj["properties_decoded"] is True for obj in text)
+    assert all(obj["properties_summary"] is not None for obj in text)
+    assert all(obj["animations"] is None for obj in text)
+    # Pin string surface so a Yuniversal-encoding regression on real
+    # FNAF panel sprites surfaces here, not in the renderer pass.
+    text_values = {obj["properties_summary"]["value"] for obj in text}
+    assert "Loading..." in text_values
+    assert "Game Over" in text_values
+
+    # Extension still stays raw in V0. The Rust pack_probe's
     # null-pattern oracle relies on this contract — when a new body
     # decoder ships these flip and the oracle fires as the loop signal.
     assert all(obj["properties_decoded"] is False for obj in other)

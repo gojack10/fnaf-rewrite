@@ -52,6 +52,7 @@ from fnaf_parser.decoders.frame_items import (
     OBJECT_TYPE_ACTIVE,
     OBJECT_TYPE_BACKDROP,
     OBJECT_TYPE_COUNTER,
+    OBJECT_TYPE_TEXT,
     decode_frame_items,
     object_type_name,
 )
@@ -182,7 +183,9 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
       emit display-style + image-handle list summary.
     * Backdrop (object_type=1) → ``obj.backdrop`` is a ``BackdropBody``;
       emit obstacle/collision enums + width/height + image_handle.
-    * Other types (Text, Extension) → no decoded body yet;
+    * Text (object_type=3) → ``obj.text`` is a ``TextBody``; emit
+      box dimensions + Paragraph (font handle / flags / color / value).
+    * Other types (Extension) → no decoded body yet;
       ``properties_decoded=false`` and ``properties_summary=null``. The
       Rust pack_probe non-Active null-pattern oracle relies on this
       contract to fire the schema-drift tripwire when a new body decoder
@@ -192,6 +195,7 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
         obj.properties is not None
         or obj.counter is not None
         or obj.backdrop is not None
+        or obj.text is not None
     )
     animations = None
     properties_summary: dict[str, Any] | None = None
@@ -211,6 +215,8 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
         properties_summary = obj.counter.summary_dict()
     elif obj.backdrop is not None:
         properties_summary = obj.backdrop.summary_dict()
+    elif obj.text is not None:
+        properties_summary = obj.text.summary_dict()
 
     return {
         "handle": obj.handle,
@@ -230,9 +236,11 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
     """Serialize the pack-level ObjectInfo bank.
 
     Active objects carry decoded ObjectCommon animation tables. Counter
-    objects carry decoded display-style + image-handle list. Other
-    object types (Backdrop, Text, Extension) intentionally remain raw
-    in V0 (``properties_decoded=false``) so downstream code can
+    objects carry decoded display-style + image-handle list. Backdrop
+    objects carry decoded obstacle/collision enums + dims + image
+    handle. Text objects carry decoded Paragraph (font handle / flags /
+    color / value) + box dims. Extension objects intentionally remain
+    raw in V0 (``properties_decoded=false``) so downstream code can
     distinguish "not present" from "present but deferred by scope".
     """
     objects = [_object_info_to_runtime_dict(obj) for obj in frame_items.items]
@@ -291,6 +299,17 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
         }
     )
 
+    text_objects = [
+        obj for obj in frame_items.items if obj.object_type == OBJECT_TYPE_TEXT
+    ]
+    text_decoded = [obj for obj in text_objects if obj.text is not None]
+    unique_text_font_handles = sorted(
+        {obj.text.font_handle for obj in text_decoded if obj.text is not None}
+    )
+    text_total_chars = sum(
+        obj.text.char_count for obj in text_decoded if obj.text is not None
+    )
+
     return {
         "count": frame_items.count,
         "active_count": len(active_objects),
@@ -305,6 +324,10 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
         "backdrop_count": len(backdrop_objects),
         "backdrop_decoded_count": len(backdrop_decoded),
         "backdrop_unique_image_handles": unique_backdrop_image_handles,
+        "text_count": len(text_objects),
+        "text_decoded_count": len(text_decoded),
+        "text_total_chars": text_total_chars,
+        "text_unique_font_handles": unique_text_font_handles,
         "deferred_sub_chunk_ids_seen": sorted(
             f"0x{cid:04X}" for cid in frame_items.deferred_sub_chunk_ids_seen
         ),
@@ -460,6 +483,12 @@ def _build_master_manifest(
             ],
             "backdrop_unique_image_handles": len(
                 object_bank_summary["backdrop_unique_image_handles"]
+            ),
+            "text_objects": object_bank_summary["text_count"],
+            "text_decoded_objects": object_bank_summary["text_decoded_count"],
+            "text_total_chars": object_bank_summary["text_total_chars"],
+            "text_unique_font_handles": len(
+                object_bank_summary["text_unique_font_handles"]
             ),
         },
     }

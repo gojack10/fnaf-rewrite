@@ -94,6 +94,19 @@ FNAF1_BACKDROP_OBSTACLE_TYPES = {0: 15}  # all None
 FNAF1_BACKDROP_COLLISION_TYPES = {0: 15}  # all Fine
 FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES = 15  # one handle per backdrop
 
+# Text inventory pinned by the 2026-04-25 Text Body Decoder probe
+# (parser/temp-probes/text_body_2026_04_25/probe.py).
+FNAF1_TEXT_COUNT = 10
+FNAF1_TEXT_BODY_SIZES = {  # one body per distinct size; all 10 unique
+    148: 1, 154: 1, 156: 1, 160: 1, 164: 1,
+    166: 1, 188: 1, 238: 1, 314: 1, 480: 1,
+}
+FNAF1_TEXT_TOTAL_PROPERTIES_BYTES = sum(
+    size * count for size, count in FNAF1_TEXT_BODY_SIZES.items()
+)  # 2068
+FNAF1_TEXT_PARAGRAPH_COUNT = 1  # every body has exactly one Paragraph
+FNAF1_TEXT_COLOR = 0x00FFFFFF  # every body renders as white
+
 
 # --- Synthetic helpers ---------------------------------------------------
 
@@ -844,6 +857,75 @@ def test_fnaf1_backdrop_body_snapshot(fnaf1_image_bank):
     assert full_screen.backdrop is not None
     assert full_screen.backdrop.width == 1280
     assert full_screen.backdrop.height == 720
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_text_body_snapshot():
+    """Antibody #11 (Text Body Decoder, 2026-04-25): all 10 FNAF 1 Text
+    ObjectInfo bodies decode through ``decode_text_body``.
+
+    Pins:
+
+    * 10/10 Texts decode (``item.text`` is populated).
+    * Body sizes match the empirical histogram from the probe ship-log
+      (one body per distinct size; sizes 148..480).
+    * ``paragraph_count == 1`` on every Text — FNAF 1 never uses
+      multi-paragraph Text objects. If a 2.0+ Clickteam game appears
+      with multi-paragraph this assertion fires loudly.
+    * ``color == 0x00FFFFFF`` on every Text — FNAF 1 only renders white
+      labels. A non-white text in a future probe is a tripwire that the
+      color-decoding swap would silently miss.
+    * ``body_size == 146 + 2 * len(value)`` for every body (the wire
+      shape derived from CTFAK's ``Text + Paragraph`` layout).
+    * Text and Active/Counter/Backdrop branches are mutually exclusive.
+    * Pin two distinctive UI strings (``Loading...``, ``Game Over``)
+      so a Yuniversal-encoding regression on real FNAF panel sprites
+      surfaces here, not in the renderer pass.
+    """
+    blob, result, transform = _fnaf1_transform_and_records()
+    fi_rec = next(r for r in result.records if r.id == 0x2229)
+    payload = read_chunk_payload(blob, fi_rec, transform=transform)
+    fi = decode_frame_items(
+        payload, unicode=result.header.unicode, transform=transform
+    )
+
+    texts = [item for item in fi.items if item.object_type == OBJECT_TYPE_TEXT]
+    assert len(texts) == FNAF1_TEXT_COUNT
+    assert all(item.text is not None for item in texts)
+    # Mutual exclusion across the four decoded-body branches.
+    assert all(item.properties is None for item in texts)
+    assert all(item.counter is None for item in texts)
+    assert all(item.backdrop is None for item in texts)
+
+    body_size_hist: dict[int, int] = {}
+    for item in texts:
+        size = len(item.properties_raw)
+        body_size_hist[size] = body_size_hist.get(size, 0) + 1
+    assert body_size_hist == FNAF1_TEXT_BODY_SIZES
+    assert sum(len(item.properties_raw) for item in texts) == (
+        FNAF1_TEXT_TOTAL_PROPERTIES_BYTES
+    )
+
+    for item in texts:
+        body = item.text
+        assert body is not None
+        # size field round-trips to len(properties_raw)
+        assert body.size == len(item.properties_raw)
+        # FNAF-1 tripwires: paragraph count, color, body-size formula.
+        assert body.paragraph_count == FNAF1_TEXT_PARAGRAPH_COUNT
+        assert body.paragraph_offsets == (20,)
+        assert body.color == FNAF1_TEXT_COLOR
+        assert body.size == 146 + 2 * len(body.value)
+        # inner_size mirror is consistent with body_size.
+        assert body.inner_size == body.size - 116
+
+    # Pin two distinctive UI strings (the loading-screen / game-over
+    # labels) so any silent encoding swap would surface here.
+    by_value = {body.text.value: body.text for body in texts if body.text is not None}
+    assert "Loading..." in by_value
+    assert "Game Over" in by_value
+    # Every observed value must be non-empty (FNAF 1 inventory).
+    assert all(body.text and body.text.value for body in texts)
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
