@@ -1,4 +1,4 @@
-"""`fnaf-parser` CLI — argparse dispatcher for the three subcommands.
+"""`fnaf-parser` CLI — argparse dispatcher for the four subcommands.
 
 History
 -------
@@ -30,6 +30,17 @@ CLI Scaffolding replaces that with a proper argparse tree:
         `combined.json` (merged) + `combined.jsonl` (one condition or
         action per line) + `manifest.json` (navigation index with
         SHA-256 hashes).
+
+    fnaf-parser dump-runtime-pack <exe> --out <dir>
+        Runtime-pack emission entry point. Consumes what
+        `decode_frame()` already produces in memory (palette,
+        virtual_rect, layers, layer_effects, item_instances, fades,
+        mvt_timer_base) and writes per-frame scene-start JSON to
+        `runtime_pack/frames_state/` plus a master manifest at
+        `runtime_pack/manifest.json` indexing every file across
+        algorithm/, images/, audio/, and runtime_pack/. Must be run
+        AFTER `dump-algorithm` and `dump-assets` — the master
+        manifest is incomplete without those outputs on disk.
 
 Env-var compatibility
 ---------------------
@@ -71,6 +82,7 @@ from fnaf_parser.decoders.images_pixels import decode_image_pixels
 from fnaf_parser.decoders.sounds import decode_sound_bank
 from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START, pe_data_pack_start
 from fnaf_parser.pipeline import load_pack
+from fnaf_parser.runtime_pack.emit import dump_runtime_pack
 from fnaf_parser.sinks.audio_emit import emit_wav
 from fnaf_parser.sinks.png_emit import emit_png
 
@@ -241,6 +253,29 @@ def cmd_dump_algorithm(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Subcommand: dump-runtime-pack -------------------------------------
+
+
+def cmd_dump_runtime_pack(args: argparse.Namespace) -> int:
+    """`fnaf-parser dump-runtime-pack <exe> --out <dir>` — V0 runtime pack.
+
+    Delegates to `fnaf_parser.runtime_pack.emit.dump_runtime_pack`,
+    which walks every 0x3333 Frame chunk, serializes the non-events
+    sub-fields (palette, layers, item_instances, etc.) to
+    `runtime_pack/frames_state/frame_NN_<slug>.json`, and writes a
+    master manifest at `runtime_pack/manifest.json` covering every
+    file across algorithm/, images/, audio/, and runtime_pack/.
+
+    Must be run AFTER `dump-algorithm` and `dump-assets`: the master
+    manifest is incomplete (and silently so) without those outputs on
+    disk. `dump_runtime_pack` enforces this by raising loudly.
+    """
+    console = Console()
+    written = dump_runtime_pack(args.exe, args.out)
+    console.print(f"[green]wrote[/green] {len(written)} file(s) -> {args.out}")
+    return 0
+
+
 # --- Argparse tree ------------------------------------------------------
 
 
@@ -252,8 +287,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="fnaf-parser",
         description=(
             "FNAF 1 Clickteam Fusion 2.5 data-pack parser. "
-            "Three subcommands: structural parse, asset dump "
-            "(PNG + WAV), and algorithm dump (JSON + JSONL)."
+            "Four subcommands: structural parse, asset dump "
+            "(PNG + WAV), algorithm dump (JSON + JSONL), "
+            "and runtime-pack dump (scene-start JSON + master manifest)."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -310,6 +346,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (auto-created).",
     )
     alg_p.set_defaults(func=cmd_dump_algorithm)
+
+    # dump-runtime-pack
+    rp_p = subparsers.add_parser(
+        "dump-runtime-pack",
+        help="Emit per-frame scene-start JSON + master pack manifest.",
+        description=(
+            "V0 runtime-pack dump: per-frame scene-start JSON under "
+            "runtime_pack/frames_state/ + master manifest at "
+            "runtime_pack/manifest.json indexing every file across "
+            "algorithm/, images/, audio/, and runtime_pack/. "
+            "Must be run after dump-algorithm and dump-assets; "
+            "refuses to emit a partial manifest otherwise."
+        ),
+    )
+    rp_p.add_argument("exe", type=Path, help="Path to the Clickteam .exe")
+    rp_p.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help=(
+            "Output directory. Must already contain algorithm/, "
+            "images/, and audio/ sub-dirs from the prior dump-algorithm "
+            "and dump-assets runs."
+        ),
+    )
+    rp_p.set_defaults(func=cmd_dump_runtime_pack)
 
     return parser
 

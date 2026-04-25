@@ -28,10 +28,11 @@ FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.
 # --- Argparse surface --------------------------------------------------
 
 
-def test_build_parser_exposes_three_subcommands():
-    """The CLI exposes exactly `parse`, `dump-assets`, `dump-algorithm`.
+def test_build_parser_exposes_four_subcommands():
+    """The CLI exposes exactly `parse`, `dump-assets`, `dump-algorithm`,
+    `dump-runtime-pack`.
 
-    If a future work unit adds a fourth subcommand, update this list
+    If a future work unit adds a fifth subcommand, update this list
     deliberately — silently widening the CLI surface is the kind of
     drift the Parity Maintenance habit is meant to catch.
     """
@@ -43,6 +44,7 @@ def test_build_parser_exposes_three_subcommands():
         "parse",
         "dump-assets",
         "dump-algorithm",
+        "dump-runtime-pack",
     }
 
 
