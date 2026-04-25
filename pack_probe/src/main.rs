@@ -10,8 +10,10 @@
 //                - Backdrop (15):  BackdropPropertiesSummary (obstacle/collision
 //                                  + width/height + image_handle),
 //                - Text     (10):  TextPropertiesSummary (Paragraph + box dims),
-//                - non-(Active|Counter|Backdrop|Text) (3): assert "no decode yet"
-//                                  null pattern.
+//                - Extension (32/33/34) (3): assert intentionally-opaque
+//                                  null pattern. Per the 2026-04-24 runtime-
+//                                  usage probe, FNAF runtime never reads
+//                                  these bodies — no decoder will be written.
 //          Catalog every failure as a probe target back on the parser side.
 //
 // NOT a real runtime. No game logic. Read-and-introspect only.
@@ -414,17 +416,20 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     //    on the shared shape (handle/header/name/object_type/...).
     // 2. Active (object_type==2) → ActiveAnimations + ActivePropertiesSummary
     //    (deny_unknown_fields). Catches drift in the rich Active inner shape.
-    // 3. Non-Active (other types) → must currently match the "no decode yet"
-    //    null pattern: properties_decoded=false, properties_summary=null,
-    //    animations=null. When parser ships Counter/Backdrop/Text/Extension
-    //    decoders, this assertion will start failing — that's the trigger to
-    //    add typed structs for those types.
+    // 3. Extension (32/33/34) → must match the intentionally-opaque null pattern:
+    //    properties_decoded=false, properties_summary=null, animations=null.
+    //    Per the 2026-04-24 runtime-usage probe (see [[Date & Time Extension
+    //    Runtime]] / [[Ini Extension Runtime]]), FNAF runtime never reads
+    //    extension bodies. The opaque pattern is the EXPECTED final state for
+    //    these types — not a TODO. If this assertion fires, somebody started
+    //    decoding extension bodies; revert or update the assertion intentionally.
+    // 4. Any other object_type → schema drift; surface as failure.
 
     let mut envelope_ok = 0_u32;
     let mut active_typed_ok = 0_u32;
     let mut counter_typed_ok = 0_u32;
     let mut backdrop_typed_ok = 0_u32;
-    let mut nonactive_null_ok = 0_u32;
+    let mut extension_opaque_ok = 0_u32;
 
     // Accumulate Active-side stats once typed deserialization succeeds.
     let mut active_max_anim_items = 0_u32;
@@ -811,9 +816,14 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                 walked_text_unique_font_handles.insert(summary.font_handle);
                 text_typed_ok += 1;
             }
-            _ => {
-                // Non-(Active|Counter|Backdrop|Text) — no decoder shipped yet.
-                // Assert the null pattern.
+            32 | 33 | 34 => {
+                // Extension (Perspective=32 / Ini=33 / Date & Time=34) —
+                // intentionally opaque. Per the 2026-04-24 runtime-usage probe
+                // (parser/temp-probes/extension_runtime_usage_2026_04_24/),
+                // FNAF runtime never reads these bodies. Decision recorded on
+                // [[Date & Time Extension Runtime]] / [[Ini Extension Runtime]]:
+                // skip body decode entirely. The opaque null pattern is the
+                // EXPECTED final state, NOT a TODO.
                 let mut pattern_failures = Vec::new();
                 if envelope.properties_decoded {
                     pattern_failures.push("properties_decoded=true");
@@ -825,13 +835,15 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                     pattern_failures.push("animations present");
                 }
                 if pattern_failures.is_empty() {
-                    nonactive_null_ok += 1;
+                    extension_opaque_ok += 1;
                 } else {
-                    // This is the GOOD trigger — when parser ships decoders for
-                    // Extension, this fires. Re-flag as "type new structs."
+                    // If this fires, somebody started decoding extension bodies.
+                    // Per the runtime-usage probe that's not needed and shouldn't
+                    // happen — surface so we can decide intentionally.
                     failures.push(format!(
-                        "non-(Active|Counter|Backdrop|Text) type={} ({}) handle={} name={:?} broke null-pattern: {} \
-                         — TIME TO ADD TYPED STRUCTS FOR THIS TYPE",
+                        "Extension type={} ({}) handle={} name={:?} unexpectedly decoded: {} \
+                         — bodies are intentionally opaque per Date & Time / Ini Runtime nodes; \
+                         either revert the parser-side decode or update this assertion",
                         envelope.object_type,
                         envelope.object_type_name,
                         envelope.handle,
@@ -839,6 +851,18 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                         pattern_failures.join(", "),
                     ));
                 }
+            }
+            _ => {
+                // Unknown object_type — schema drift. FNAF 1 only has types
+                // 1 (Backdrop), 2 (Active), 3 (Text), 7 (Counter), 32-34 (Extension).
+                failures.push(format!(
+                    "unknown object_type={} ({}) handle={} name={:?} — schema drift; \
+                     parser emitted an object_type pack_probe doesn't recognize",
+                    envelope.object_type,
+                    envelope.object_type_name,
+                    envelope.handle,
+                    envelope.name,
+                ));
             }
         }
     }
@@ -901,15 +925,23 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
             text_typed_ok, objects.text_count,
         ));
     }
-    let nonactive_total = objects.count
+    // Extension types (32/33/34) are intentionally opaque per the 2026-04-24
+    // runtime-usage probe. Expected count = 196 - 124A - 44C - 15B - 10T = 3.
+    let extension_total = objects.count
         - objects.active_count
         - objects.counter_count
         - objects.backdrop_count
         - objects.text_count;
-    if nonactive_null_ok != nonactive_total {
+    if extension_opaque_ok != extension_total {
         failures.push(format!(
-            "non-(Active|Counter|Backdrop|Text) null-pattern matched {} of {} remaining",
-            nonactive_null_ok, nonactive_total,
+            "Extension intentionally-opaque null-pattern matched {} of {} extensions",
+            extension_opaque_ok, extension_total,
+        ));
+    }
+    if extension_total != 3 {
+        failures.push(format!(
+            "extension_total={} expected 3 (32 Perspective + 33 Ini + 34 Date & Time)",
+            extension_total,
         ));
     }
 
@@ -1035,10 +1067,18 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     }
 
     // Surface the deferred-chunk antibody signal.
+    //
+    // 0x4446 is the ObjectCommon Properties body chunk. It appears in the
+    // deferred set when the parser saw the chunk but didn't decode it. After
+    // the 2026-04-24 runtime-usage probe, the 3 Extension bodies (Perspective /
+    // Ini / Date & Time) are intentionally NOT decoded — runtime never reads
+    // them. So 0x4446 staying in this list for Extension types is the expected
+    // steady state, not a TODO. Only investigate if a non-Extension type
+    // surfaces here.
     if !objects.deferred_sub_chunk_ids_seen.is_empty() {
         println!(
-            "[deferred] sub_chunk_ids_seen = {:?} (signal: parser left these undecoded — \
-             will drop to [] when Extension body decoders ship)",
+            "[deferred] sub_chunk_ids_seen = {:?} (signal: 3 Extension bodies are \
+             intentionally undecoded; 0x4446 here is expected steady state)",
             objects.deferred_sub_chunk_ids_seen,
         );
     }
@@ -1062,7 +1102,7 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         objects.text_count,
     );
     println!(
-        "[typed pass] non-(Active|Counter|Backdrop|Text) OK  : {nonactive_null_ok} / {nonactive_total}",
+        "[typed pass] Extension intentionally-opaque OK  : {extension_opaque_ok} / {extension_total}",
     );
     println!(
         "[Active rollup]   max_anim_items={} total_directions={} total_frames={} \
