@@ -31,7 +31,9 @@ import sys
 
 from fnaf_parser.cli import main as cli_main
 
-_KNOWN_SUBCOMMANDS = frozenset({"parse", "dump-assets", "dump-algorithm", "-h", "--help"})
+_KNOWN_SUBCOMMANDS = frozenset(
+    {"parse", "dump-assets", "dump-algorithm", "dump-runtime-pack", "-h", "--help"}
+)
 
 
 def main() -> int:
