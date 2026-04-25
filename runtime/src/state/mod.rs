@@ -17,6 +17,8 @@
 //! 4. Per-event-group flags (Once/Every/NotAlways) — TODO.
 //! 5. Sound channels, pending frame transition, input — TODO.
 
+pub mod alterables;
 pub mod counters;
 
+pub use alterables::{Alterables, InstanceId, SLOT_COUNT};
 pub use counters::Counters;
