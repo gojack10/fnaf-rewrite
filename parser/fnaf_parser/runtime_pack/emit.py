@@ -50,6 +50,7 @@ from fnaf_parser.compression import read_chunk_payload
 from fnaf_parser.decoders.frame import decode_frame
 from fnaf_parser.decoders.frame_items import (
     OBJECT_TYPE_ACTIVE,
+    OBJECT_TYPE_BACKDROP,
     OBJECT_TYPE_COUNTER,
     decode_frame_items,
     object_type_name,
@@ -179,13 +180,19 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
       emit Active animation summary + flattened animation items.
     * Counter (object_type=7) → ``obj.counter`` is a ``CounterBody``;
       emit display-style + image-handle list summary.
-    * Other types (Backdrop, Text, Extension) → no decoded body yet;
+    * Backdrop (object_type=1) → ``obj.backdrop`` is a ``BackdropBody``;
+      emit obstacle/collision enums + width/height + image_handle.
+    * Other types (Text, Extension) → no decoded body yet;
       ``properties_decoded=false`` and ``properties_summary=null``. The
       Rust pack_probe non-Active null-pattern oracle relies on this
       contract to fire the schema-drift tripwire when a new body decoder
       ships.
     """
-    decoded = (obj.properties is not None) or (obj.counter is not None)
+    decoded = (
+        obj.properties is not None
+        or obj.counter is not None
+        or obj.backdrop is not None
+    )
     animations = None
     properties_summary: dict[str, Any] | None = None
 
@@ -202,6 +209,8 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
             }
     elif obj.counter is not None:
         properties_summary = obj.counter.summary_dict()
+    elif obj.backdrop is not None:
+        properties_summary = obj.backdrop.summary_dict()
 
     return {
         "handle": obj.handle,
@@ -268,6 +277,20 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
         }
     )
 
+    backdrop_objects = [
+        obj for obj in frame_items.items if obj.object_type == OBJECT_TYPE_BACKDROP
+    ]
+    backdrop_decoded = [
+        obj for obj in backdrop_objects if obj.backdrop is not None
+    ]
+    unique_backdrop_image_handles = sorted(
+        {
+            obj.backdrop.image_handle
+            for obj in backdrop_decoded
+            if obj.backdrop is not None
+        }
+    )
+
     return {
         "count": frame_items.count,
         "active_count": len(active_objects),
@@ -279,6 +302,9 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
         "counter_decoded_count": len(counter_decoded),
         "counter_total_handle_refs": counter_total_handle_refs,
         "counter_unique_image_handles": unique_counter_image_handles,
+        "backdrop_count": len(backdrop_objects),
+        "backdrop_decoded_count": len(backdrop_decoded),
+        "backdrop_unique_image_handles": unique_backdrop_image_handles,
         "deferred_sub_chunk_ids_seen": sorted(
             f"0x{cid:04X}" for cid in frame_items.deferred_sub_chunk_ids_seen
         ),
@@ -427,6 +453,13 @@ def _build_master_manifest(
             ],
             "counter_unique_image_handles": len(
                 object_bank_summary["counter_unique_image_handles"]
+            ),
+            "backdrop_objects": object_bank_summary["backdrop_count"],
+            "backdrop_decoded_objects": object_bank_summary[
+                "backdrop_decoded_count"
+            ],
+            "backdrop_unique_image_handles": len(
+                object_bank_summary["backdrop_unique_image_handles"]
             ),
         },
     }

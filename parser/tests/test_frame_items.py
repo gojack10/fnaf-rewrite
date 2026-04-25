@@ -85,6 +85,15 @@ FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES = 201
 FNAF1_COUNTER_BODY_SIZES = {180: 43, 162: 1}
 FNAF1_COUNTER_OUTLIER_NAME = "usage meter"  # 162-byte body, only one
 
+# Backdrop inventory pinned by the 2026-04-25 Backdrop Body Decoder probe
+# (parser/temp-probes/backdrop_body_2026_04_25/probe.py).
+FNAF1_BACKDROP_COUNT = 15
+FNAF1_BACKDROP_BODY_SIZE = 18  # every body is exactly 18 bytes
+FNAF1_BACKDROP_TOTAL_PROPERTIES_BYTES = 15 * 18  # 270
+FNAF1_BACKDROP_OBSTACLE_TYPES = {0: 15}  # all None
+FNAF1_BACKDROP_COLLISION_TYPES = {0: 15}  # all Fine
+FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES = 15  # one handle per backdrop
+
 
 # --- Synthetic helpers ---------------------------------------------------
 
@@ -286,6 +295,7 @@ def test_roundtrip_multiple_object_infos_preserve_order():
         unicode=True,
         decode_active_properties=False,
         decode_counter_properties=False,
+        decode_backdrop_properties=False,
     )
     assert fi.count == 3
     assert [it.handle for it in fi.items] == [0, 1, 2]
@@ -750,6 +760,90 @@ def test_fnaf1_counter_body_snapshot(fnaf1_image_bank):
     assert night.counter is not None
     assert night.counter.display_style == 1
     assert night.counter.image_handle_count == 14
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_backdrop_body_snapshot(fnaf1_image_bank):
+    """Antibody #10 (Backdrop Body Decoder, 2026-04-25): all 15 FNAF 1
+    Backdrop ObjectInfo bodies decode through ``decode_backdrop_body``.
+
+    Pins:
+
+    * 15/15 Backdrops decode (``item.backdrop`` is populated).
+    * Every body is exactly 18 bytes (no legacy ``Settings.Old`` 10B
+      variant in FNAF 1).
+    * ``obstacle_type`` and ``collision_type`` are 0 on every backdrop —
+      FNAF 1 does not use Clickteam's backdrop obstacle layer.
+    * ``width`` and ``height`` are u32 fields whose high halves are zero
+      (no backdrop is ≥ 65536px) but the wire field genuinely is 32
+      bits per CTFAK2.0 ``Backdrop.cs:52-53``.
+    * Every backdrop image handle resolves into the sparse 605-record
+      ImageBank handle set (sparse-handle rule).
+    * Backdrop and Active/Counter branches are mutually exclusive.
+    """
+    blob, result, transform = _fnaf1_transform_and_records()
+    fi_rec = next(r for r in result.records if r.id == 0x2229)
+    payload = read_chunk_payload(blob, fi_rec, transform=transform)
+    fi = decode_frame_items(
+        payload, unicode=result.header.unicode, transform=transform
+    )
+
+    backdrops = [
+        item for item in fi.items if item.object_type == OBJECT_TYPE_BACKDROP
+    ]
+    assert len(backdrops) == FNAF1_BACKDROP_COUNT
+    assert all(item.backdrop is not None for item in backdrops)
+    # Mutual exclusion across the three decoded-body branches.
+    assert all(item.properties is None for item in backdrops)
+    assert all(item.counter is None for item in backdrops)
+
+    body_size_hist: dict[int, int] = {}
+    for item in backdrops:
+        size = len(item.properties_raw)
+        body_size_hist[size] = body_size_hist.get(size, 0) + 1
+    assert body_size_hist == {FNAF1_BACKDROP_BODY_SIZE: FNAF1_BACKDROP_COUNT}
+    assert sum(len(item.properties_raw) for item in backdrops) == (
+        FNAF1_BACKDROP_TOTAL_PROPERTIES_BYTES
+    )
+
+    obstacle_hist: dict[int, int] = {}
+    collision_hist: dict[int, int] = {}
+    unique_handles: set[int] = set()
+    for item in backdrops:
+        body = item.backdrop
+        assert body is not None
+        # size field round-trips to len(properties_raw)
+        assert body.size == len(item.properties_raw)
+        # u32 width/height with high halves zero — pin so a u16 widening
+        # bug surfaces here loudly. FNAF 1's max dimension is 1280.
+        assert 0 < body.width < 65536
+        assert 0 < body.height < 65536
+        obstacle_hist[body.obstacle_type] = (
+            obstacle_hist.get(body.obstacle_type, 0) + 1
+        )
+        collision_hist[body.collision_type] = (
+            collision_hist.get(body.collision_type, 0) + 1
+        )
+        unique_handles.add(body.image_handle)
+    assert obstacle_hist == FNAF1_BACKDROP_OBSTACLE_TYPES
+    assert collision_hist == FNAF1_BACKDROP_COLLISION_TYPES
+    assert len(unique_handles) == FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES
+
+    # Sparse-handle antibody: every backdrop image handle must be a
+    # member of the decoded ImageBank handle set, NOT just `handle <
+    # image_count`. Same FNAF 1 antibody that bit Active animations.
+    missing_handles = sorted(unique_handles - fnaf1_image_bank.handles)
+    assert missing_handles == []
+
+    # Pin the full-screen 1280x720 office/hallway backdrop (handle 161,
+    # name 'Backdrop'). Defends against silent layout drift on a real
+    # FNAF panel sprite that the renderer must place pixel-perfect.
+    full_screen = next(
+        b for b in backdrops if b.handle == 161 and b.name == "Backdrop"
+    )
+    assert full_screen.backdrop is not None
+    assert full_screen.backdrop.width == 1280
+    assert full_screen.backdrop.height == 720
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")

@@ -103,6 +103,11 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.backdrop_body import (
+    BackdropBody,
+    BackdropBodyDecodeError,
+    decode_backdrop_body,
+)
 from fnaf_parser.decoders.counter_body import (
     CounterBody,
     CounterBodyDecodeError,
@@ -309,10 +314,12 @@ class ObjectInfo:
     `sub_records`). For Active objects, `properties` carries the decoded
     ObjectCommon body when `decode_frame_items(..., decode_active_properties=True)`
     is used. For Counter objects (object_type=7), `counter` carries the
-    decoded CounterBody when `decode_counter_properties=True`. The two
+    decoded CounterBody when `decode_counter_properties=True`. For
+    Backdrop objects (object_type=1), `backdrop` carries the decoded
+    BackdropBody when `decode_backdrop_properties=True`. The three
     decoded-body fields are mutually exclusive — at most one is non-None
-    per ObjectInfo. Other object types (Backdrop, Text, Extension) stay
-    raw until their body shapes are probed separately.
+    per ObjectInfo. Other object types (Text, Extension) stay raw until
+    their body shapes are probed separately.
     """
     header: ObjectHeader
     name: str | None
@@ -321,6 +328,7 @@ class ObjectInfo:
     sub_records: tuple[ObjectInfoSubChunkRecord, ...]
     properties: ObjectCommon | None = field(default=None, repr=False)
     counter: CounterBody | None = field(default=None, repr=False)
+    backdrop: BackdropBody | None = field(default=None, repr=False)
 
     @property
     def handle(self) -> int:
@@ -331,11 +339,17 @@ class ObjectInfo:
         return self.header.object_type
 
     def as_dict(self) -> dict:
-        body_decoded = (self.properties is not None) or (self.counter is not None)
+        body_decoded = (
+            self.properties is not None
+            or self.counter is not None
+            or self.backdrop is not None
+        )
         if self.properties is not None:
             body_dict: dict | None = self.properties.as_dict()
         elif self.counter is not None:
             body_dict = self.counter.as_dict()
+        elif self.backdrop is not None:
+            body_dict = self.backdrop.as_dict()
         else:
             body_dict = None
         return {
@@ -374,13 +388,13 @@ class FrameItems:
     `deferred_sub_chunk_ids_seen` is the set of inner sub-chunk ids whose
     bodies were not structurally decoded by this probe (i.e. still need a
     follow-up decoder). 0x4446 is added only when its body is present but
-    not consumed — Actives that decode via `decode_object_common` and
-    Counters that decode via `decode_counter_body` are NOT marked
-    deferred. On FNAF 1 the set still contains 0x4446 because 28
-    non-(Active|Counter) ObjectInfos (Backdrops, Texts, Extensions) carry
-    undecoded property bodies, and 0x4448 because no Effects decoder
-    exists yet. Drops to empty once every body sub-chunk has a
-    structured decoder.
+    not consumed — Actives that decode via `decode_object_common`,
+    Counters that decode via `decode_counter_body`, and Backdrops that
+    decode via `decode_backdrop_body` are NOT marked deferred. On FNAF 1
+    the set still contains 0x4446 because 13 non-(Active|Counter|Backdrop)
+    ObjectInfos (Texts, Extensions) carry undecoded property bodies, and
+    0x4448 because no Effects decoder exists yet. Drops to empty once
+    every body sub-chunk has a structured decoder.
     """
     items: tuple[ObjectInfo, ...]
     deferred_encrypted: tuple[ObjectInfoSubChunkRecord, ...]
@@ -558,6 +572,7 @@ def _decode_one_object_info(
     deferred_encrypted: list[ObjectInfoSubChunkRecord],
     decode_active_properties: bool,
     decode_counter_properties: bool,
+    decode_backdrop_properties: bool,
 ) -> tuple[ObjectInfo, int]:
     """Decode one ObjectInfo starting at `start` in the outer payload.
 
@@ -656,11 +671,29 @@ def _decode_one_object_info(
                 f"offset 0x{start:x}: {exc}"
             ) from exc
 
+    backdrop: BackdropBody | None = None
+    if (
+        decode_backdrop_properties
+        and header.object_type == OBJECT_TYPE_BACKDROP
+        and properties_raw
+    ):
+        try:
+            backdrop = decode_backdrop_body(properties_raw)
+        except BackdropBodyDecodeError as exc:
+            raise FrameItemsDecodeError(
+                f"0x2229 FrameItems: Backdrop ObjectInfo handle={header.handle} "
+                f"name={name!r} has malformed Backdrop properties "
+                f"({len(properties_raw)} bytes) at ObjectInfo payload "
+                f"offset 0x{start:x}: {exc}"
+            ) from exc
+
     # Now that the (optional) decode has run, mark 0x4446 as deferred only when
     # the body was present but NOT structurally decoded. This keeps the
     # deferred set honest: it lists sub-chunk ids whose bodies still need a
     # follow-up decoder, not just "ids we saw on the wire".
-    body_decoded = properties is not None or counter is not None
+    body_decoded = (
+        properties is not None or counter is not None or backdrop is not None
+    )
     if properties_raw and not body_decoded:
         deferred_sub_chunk_ids_seen.add(SUB_OBJECT_PROPERTIES)
 
@@ -673,6 +706,7 @@ def _decode_one_object_info(
             sub_records=sub_records,
             properties=properties,
             counter=counter,
+            backdrop=backdrop,
         ),
         end,
     )
@@ -685,6 +719,7 @@ def decode_frame_items(
     transform: TransformState | None = None,
     decode_active_properties: bool = True,
     decode_counter_properties: bool = True,
+    decode_backdrop_properties: bool = True,
 ) -> FrameItems:
     """Decode a 0x2229 FrameItems chunk's plaintext bytes.
 
@@ -702,8 +737,11 @@ def decode_frame_items(
     exposed as `ObjectInfo.properties`. When `decode_counter_properties`
     is true (also the default), Counter ObjectInfo 0x4446 bodies are
     decoded through `counter_body.py` and exposed as `ObjectInfo.counter`.
-    Other object types (Backdrop, Text, Extension) stay raw in
-    `properties_raw` until their body shapes are probed separately.
+    When `decode_backdrop_properties` is true (also the default),
+    Backdrop ObjectInfo 0x4446 bodies are decoded through
+    `backdrop_body.py` and exposed as `ObjectInfo.backdrop`. Other
+    object types (Text, Extension) stay raw in `properties_raw` until
+    their body shapes are probed separately.
 
     Antibodies enforced:
 
@@ -754,6 +792,7 @@ def decode_frame_items(
             deferred_encrypted=deferred_encrypted,
             decode_active_properties=decode_active_properties,
             decode_counter_properties=decode_counter_properties,
+            decode_backdrop_properties=decode_backdrop_properties,
         )
 
         existing_idx = seen_handles.get(obj.handle)

@@ -71,6 +71,8 @@ FNAF1_AUDIO_COUNT = 52
 FNAF1_COUNTER_COUNT = 44
 FNAF1_COUNTER_TOTAL_HANDLE_REFS = 607
 FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES = 201
+FNAF1_BACKDROP_COUNT = 15
+FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES = 15
 
 
 # --- Fixture ------------------------------------------------------------
@@ -226,6 +228,11 @@ def test_antibody_counts_are_self_consistent(_pack_out: Path) -> None:
     assert counts["counter_unique_image_handles"] == (
         FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES
     )
+    assert counts["backdrop_objects"] == FNAF1_BACKDROP_COUNT
+    assert counts["backdrop_decoded_objects"] == FNAF1_BACKDROP_COUNT
+    assert counts["backdrop_unique_image_handles"] == (
+        FNAF1_BACKDROP_UNIQUE_IMAGE_HANDLES
+    )
 
     # Cross-check counts against the files list
     png_count = sum(1 for k in files if k.endswith(".png"))
@@ -270,10 +277,15 @@ def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None
     counter = [
         obj for obj in object_bank["objects"] if obj["object_type_name"] == "Counter"
     ]
+    backdrop = [
+        obj
+        for obj in object_bank["objects"]
+        if obj["object_type_name"] == "Backdrop"
+    ]
     other = [
         obj
         for obj in object_bank["objects"]
-        if obj["object_type_name"] not in {"Active", "Counter"}
+        if obj["object_type_name"] not in {"Active", "Counter", "Backdrop"}
     ]
     assert len(active) == FNAF1_ACTIVE_COUNT
     assert all(obj["properties_decoded"] is True for obj in active)
@@ -287,7 +299,15 @@ def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None
     assert all(obj["properties_summary"] is not None for obj in counter)
     assert all(obj["animations"] is None for obj in counter)
 
-    # Backdrop / Text / Extension stay raw in V0. The Rust pack_probe's
+    # Backdrops decode through `decode_backdrop_body`. They carry
+    # `properties_summary` (obstacle/collision enums + width/height +
+    # image_handle) but NOT `animations` — that field stays Active-only.
+    assert len(backdrop) == FNAF1_BACKDROP_COUNT
+    assert all(obj["properties_decoded"] is True for obj in backdrop)
+    assert all(obj["properties_summary"] is not None for obj in backdrop)
+    assert all(obj["animations"] is None for obj in backdrop)
+
+    # Text / Extension still stay raw in V0. The Rust pack_probe's
     # null-pattern oracle relies on this contract — when a new body
     # decoder ships these flip and the oracle fires as the loop signal.
     assert all(obj["properties_decoded"] is False for obj in other)
