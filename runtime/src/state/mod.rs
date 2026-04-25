@@ -20,7 +20,9 @@
 pub mod active_scalars;
 pub mod alterables;
 pub mod counters;
+pub mod group_flags;
 
 pub use active_scalars::{ActiveScalars, ActiveState};
 pub use alterables::{Alterables, InstanceId, SLOT_COUNT};
 pub use counters::Counters;
+pub use group_flags::{GroupFlags, GroupId, GroupState};
