@@ -81,11 +81,16 @@ Antibody coverage
   by 0x3338 FrameItemInstances must appear in FrameItems.by_handle.
   Enforced at the integration-test layer; the decoder exposes `by_handle`
   to make the check a trivial set membership.
-- #6 loud-skip: `deferred_sub_chunk_ids_seen` surfaces the set of
-  opaque-body sub-chunk ids (empirically `{0x4446}` for FNAF 1 —
-  every ObjectInfo carries Properties; none carry 0x4448 Effects).
-  Any other id that made it through Antibody #1 but wasn't decoded
-  is listed there for the follow-up probe to triage.
+- #6 loud-skip: `deferred_sub_chunk_ids_seen` surfaces the set of body
+  sub-chunk ids whose bodies were NOT structurally decoded (i.e. genuinely
+  need a follow-up decoder). 0x4446 (Properties) is added only when its
+  body is present but unconsumed — Active bodies that decode through
+  `decode_object_common` are NOT marked deferred. Empirically on FNAF 1
+  this set still contains `{0x4446}` because 72 non-Active ObjectInfos
+  (Backdrops, Texts, Counters, Extensions) carry undecoded property
+  bodies pending the Counter / Non-Active body decoder track. Any other
+  id that made it through Antibody #1 but wasn't decoded is listed
+  there for the follow-up probe to triage.
 - #7 snapshot: (count, sorted-handles-sample, object-type histogram)
   pinned in tests.
 """
@@ -351,9 +356,15 @@ class FrameItems:
     hands in a transform this is empty and every opaque body lives in
     `ObjectInfo.{properties,effects}_raw`.
 
-    `deferred_sub_chunk_ids_seen` is the set of inner chunk ids whose
-    decoded body the current probe scope keeps opaque (expected
-    {0x4446, 0x4448} on FNAF 1). Sub-probes #5.1+ will shrink it.
+    `deferred_sub_chunk_ids_seen` is the set of inner sub-chunk ids whose
+    bodies were not structurally decoded by this probe (i.e. still need a
+    follow-up decoder). 0x4446 is added only when its body is present but
+    not consumed — Actives whose bodies decode via `decode_object_common`
+    are NOT marked deferred. On FNAF 1 the set still contains 0x4446
+    because 72 non-Active ObjectInfos (Backdrops, Texts, Counters,
+    Extensions) carry undecoded property bodies, and 0x4448 because no
+    Effects decoder exists yet. Drops to empty once every body sub-chunk
+    has a structured decoder.
     """
     items: tuple[ObjectInfo, ...]
     deferred_encrypted: tuple[ObjectInfoSubChunkRecord, ...]
@@ -572,7 +583,14 @@ def _decode_one_object_info(
             name = decode_string_chunk(rec.decoded_payload, unicode=unicode)
         elif rec.id == SUB_OBJECT_PROPERTIES:
             properties_raw = rec.decoded_payload
-            deferred_sub_chunk_ids_seen.add(rec.id)
+            # Don't preemptively mark 0x4446 as deferred — the body MAY get
+            # decoded below (Active path via decode_object_common). We add to
+            # the deferred set after the decode block iff decoding was skipped
+            # or yielded no structured ObjectCommon. Antibody (2026-04-25):
+            # this used to add unconditionally, which left the post-decode
+            # deferred set claiming 0x4446 was undecoded even when all 124
+            # Actives decoded successfully — a misleading signal for downstream
+            # consumers of the runtime pack.
         elif rec.id == SUB_OBJECT_EFFECTS:
             effects_raw = rec.decoded_payload
             deferred_sub_chunk_ids_seen.add(rec.id)
@@ -604,6 +622,13 @@ def _decode_one_object_info(
                 f"({len(properties_raw)} bytes) at ObjectInfo payload "
                 f"offset 0x{start:x}: {exc}"
             ) from exc
+
+    # Now that the (optional) decode has run, mark 0x4446 as deferred only when
+    # the body was present but NOT structurally decoded. This keeps the
+    # deferred set honest: it lists sub-chunk ids whose bodies still need a
+    # follow-up decoder, not just "ids we saw on the wire".
+    if properties_raw and properties is None:
+        deferred_sub_chunk_ids_seen.add(SUB_OBJECT_PROPERTIES)
 
     return (
         ObjectInfo(

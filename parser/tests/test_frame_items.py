@@ -659,6 +659,68 @@ def test_fnaf1_active_object_common_snapshot(fnaf1_image_bank):
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_deferred_set_excludes_decoded_active_properties():
+    """Stale-field antibody (2026-04-25): `deferred_sub_chunk_ids_seen` must
+    contain 0x4446 only when the body is genuinely undecoded — NOT when
+    decode_object_common consumed it successfully. Pre-fix the parser added
+    0x4446 unconditionally at the SUB_OBJECT_PROPERTIES branch, so even after
+    every Active body decoded the deferred set still claimed work was
+    outstanding. Existing assertions (FNAF1 snapshot) couldn't catch this
+    because non-Actives also leave 0x4446 in the set legitimately.
+
+    This test constructs a synthetic Active-only payload from a real FNAF1
+    Active body (so `decode_object_common` will accept it) and asserts the
+    deferred set is empty after a successful decode. If 0x4446 appears here
+    the unconditional-add regression has returned.
+    """
+    # Borrow one real Active body from FNAF1 — guaranteed to decode cleanly.
+    blob, result, transform = _fnaf1_transform_and_records()
+    fi_rec = next(r for r in result.records if r.id == 0x2229)
+    real_payload = read_chunk_payload(blob, fi_rec, transform=transform)
+    real_fi = decode_frame_items(
+        real_payload, unicode=result.header.unicode, transform=transform
+    )
+    real_active = next(
+        item
+        for item in real_fi.items
+        if item.object_type == OBJECT_TYPE_ACTIVE and item.properties is not None
+    )
+    real_body = real_active.properties_raw
+
+    # Active-only synthetic payload using the real body.
+    synth = _pack_payload(
+        [
+            _pack_object_info(
+                handle=h,
+                object_type=OBJECT_TYPE_ACTIVE,
+                name=f"A{h}",
+                properties=real_body,
+            )
+            for h in range(3)
+        ]
+    )
+
+    fi_decoded = decode_frame_items(
+        synth, unicode=True, decode_active_properties=True
+    )
+    assert all(item.properties is not None for item in fi_decoded.items)
+    assert fi_decoded.deferred_sub_chunk_ids_seen == frozenset(), (
+        "0x4446 leaked into deferred set despite all Active bodies decoding "
+        "— frame_items.py SUB_OBJECT_PROPERTIES unconditional-add regression."
+    )
+
+    # Negative control: same synthetic payload, decoding disabled. The body
+    # is present but unconsumed, so 0x4446 MUST surface in the deferred set.
+    fi_undecoded = decode_frame_items(
+        synth, unicode=True, decode_active_properties=False
+    )
+    assert all(item.properties is None for item in fi_undecoded.items)
+    assert fi_undecoded.deferred_sub_chunk_ids_seen == frozenset(
+        {SUB_OBJECT_PROPERTIES}
+    )
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
 def test_fnaf1_cross_chunk_handle_resolution():
     """Cross-chunk antibody: every ObjectInstance.object_info handle
     referenced by 0x3338 FrameItemInstances across all 17 FNAF 1 frames
