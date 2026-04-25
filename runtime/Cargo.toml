@@ -1,0 +1,13 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Lean Rust mini-Clickteam runtime for FNAF 1. Currently stubs for the two extension plugins FNAF uses."
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rust-ini = "0.21"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
