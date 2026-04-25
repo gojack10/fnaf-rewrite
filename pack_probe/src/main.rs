@@ -2,11 +2,12 @@
 //
 // Phase A: untyped serde_json::Value walk. Print top-level shape, object_type
 //          histogram, and one full sample object per object_type.
-// Phase B: minimal typed deserialization at TWO levels of strictness:
+// Phase B: minimal typed deserialization at THREE levels of strictness:
 //          (1) envelope on every object — catches header/envelope drift,
 //          (2) per-object_type inner deserialize:
 //                - Active (124): full ActiveTyped (animations + summary),
-//                - non-Active (72): assert "no decode yet" null pattern.
+//                - Counter (44): CounterPropertiesSummary (display_style + handles),
+//                - non-(Active|Counter) (28): assert "no decode yet" null pattern.
 //          Catalog every failure as a probe target back on the parser side.
 //
 // NOT a real runtime. No game logic. Read-and-introspect only.
@@ -61,6 +62,9 @@ fn phase_a_untyped(manifest_path: &Path, objects_path: &Path) -> Result<()> {
         "active_decoded_count",
         "active_animation_frames",
         "active_animation_directions",
+        "counter_count",
+        "counter_decoded_count",
+        "counter_total_handle_refs",
         "count",
     ] {
         if let Some(v) = objects_doc.get(key) {
@@ -156,6 +160,10 @@ struct ObjectsFile {
     active_animation_frames: u32,
     active_animation_directions: u32,
     active_unique_image_handles: Vec<u32>,
+    counter_count: u32,
+    counter_decoded_count: u32,
+    counter_total_handle_refs: u32,
+    counter_unique_image_handles: Vec<u32>,
     count: u32,
     #[serde(default)]
     deferred_sub_chunk_ids_seen: Vec<String>,
@@ -266,6 +274,22 @@ struct ActivePropertiesSummary {
     unique_image_handles: Vec<u32>,
 }
 
+// ---- Counter-specific inner shape ----
+//
+// FNAF 1 Counter property body decodes into display_style (u32 enum) + an
+// image-handle list (u16-prefixed, max 14 in baseline). The per-object
+// `properties_summary` carries those plus a deduped `unique_image_handles`
+// view of the handles list and the on-wire body `size`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct CounterPropertiesSummary {
+    size: u32,
+    display_style: u32,
+    image_handle_count: u32,
+    unique_image_handles: Vec<u32>,
+}
+
 fn phase_b_typed(objects_path: &Path) -> Result<()> {
     println!("--- Phase B: typed deserialization ---");
 
@@ -337,6 +361,7 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
 
     let mut envelope_ok = 0_u32;
     let mut active_typed_ok = 0_u32;
+    let mut counter_typed_ok = 0_u32;
     let mut nonactive_null_ok = 0_u32;
 
     // Accumulate Active-side stats once typed deserialization succeeds.
@@ -345,6 +370,10 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     let mut active_total_frames = 0_u32;
     let mut active_total_unique_handles = 0_u32;
     let mut walked_active_unique_handles: BTreeSet<u32> = BTreeSet::new();
+
+    // Accumulate Counter-side stats once typed deserialization succeeds.
+    let mut walked_counter_total_handle_refs = 0_u32;
+    let mut walked_counter_unique_handles: BTreeSet<u32> = BTreeSet::new();
 
     for raw in &objects.objects {
         // (1) envelope
@@ -484,8 +513,66 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                 }
                 active_typed_ok += 1;
             }
+            7 => {
+                // Counter — typed inner expected (decoder shipped 2026-04-25).
+                // animations must be null (Counter has no animation table);
+                // properties_summary must typed-deserialize as
+                // CounterPropertiesSummary.
+                if !envelope.properties_decoded {
+                    failures.push(format!(
+                        "Counter handle={} name={:?} has properties_decoded=false (expected true)",
+                        envelope.handle, envelope.name,
+                    ));
+                    continue;
+                }
+                if envelope.animations.is_some() {
+                    failures.push(format!(
+                        "Counter handle={} name={:?} has animations present (expected null)",
+                        envelope.handle, envelope.name,
+                    ));
+                }
+                let summary_v = match envelope.properties_summary.as_ref() {
+                    Some(v) => v,
+                    None => {
+                        failures.push(format!(
+                            "Counter handle={} name={:?} has properties_summary=null",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let summary: CounterPropertiesSummary =
+                    match serde_json::from_value(summary_v.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            failures.push(format!(
+                                "Counter handle={} name={:?} properties_summary typed deser failed: {e}",
+                                envelope.handle, envelope.name,
+                            ));
+                            continue;
+                        }
+                    };
+
+                // Cross-check: unique_image_handles is the deduped view of the
+                // on-wire handle list, so |unique| <= image_handle_count.
+                if summary.unique_image_handles.len() as u32 > summary.image_handle_count {
+                    failures.push(format!(
+                        "Counter handle={} name={:?} unique_image_handles({}) > image_handle_count({})",
+                        envelope.handle,
+                        envelope.name,
+                        summary.unique_image_handles.len(),
+                        summary.image_handle_count,
+                    ));
+                }
+
+                walked_counter_total_handle_refs += summary.image_handle_count;
+                for h in &summary.unique_image_handles {
+                    walked_counter_unique_handles.insert(*h);
+                }
+                counter_typed_ok += 1;
+            }
             _ => {
-                // Non-Active — no decoder shipped yet. Assert the null pattern.
+                // Non-(Active|Counter) — no decoder shipped yet. Assert the null pattern.
                 let mut pattern_failures = Vec::new();
                 if envelope.properties_decoded {
                     pattern_failures.push("properties_decoded=true");
@@ -500,9 +587,9 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                     nonactive_null_ok += 1;
                 } else {
                     // This is the GOOD trigger — when parser ships decoders for
-                    // this type, this fires. Re-flag as "type new structs."
+                    // Backdrop/Text/Extension, this fires. Re-flag as "type new structs."
                     failures.push(format!(
-                        "non-Active type={} ({}) handle={} name={:?} broke null-pattern: {} \
+                        "non-(Active|Counter) type={} ({}) handle={} name={:?} broke null-pattern: {} \
                          — TIME TO ADD TYPED STRUCTS FOR THIS TYPE",
                         envelope.object_type,
                         envelope.object_type_name,
@@ -528,10 +615,25 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
             active_typed_ok, objects.active_count,
         ));
     }
-    let nonactive_total = objects.count - objects.active_count;
+    if objects.counter_count != 44 {
+        failures.push(format!("counter_count={} expected 44", objects.counter_count));
+    }
+    if objects.counter_decoded_count != objects.counter_count {
+        failures.push(format!(
+            "counter_decoded_count={} != counter_count={}",
+            objects.counter_decoded_count, objects.counter_count,
+        ));
+    }
+    if counter_typed_ok != objects.counter_count {
+        failures.push(format!(
+            "Counter typed-pass parsed {} of {} counters",
+            counter_typed_ok, objects.counter_count,
+        ));
+    }
+    let nonactive_total = objects.count - objects.active_count - objects.counter_count;
     if nonactive_null_ok != nonactive_total {
         failures.push(format!(
-            "non-Active null-pattern matched {} of {} non-actives",
+            "non-(Active|Counter) null-pattern matched {} of {} remaining",
             nonactive_null_ok, nonactive_total,
         ));
     }
@@ -570,31 +672,68 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         ));
     }
 
+    // Counter rollup cross-checks.
+    if walked_counter_total_handle_refs != objects.counter_total_handle_refs {
+        failures.push(format!(
+            "walked Counter total handle refs={} != header counter_total_handle_refs={}",
+            walked_counter_total_handle_refs, objects.counter_total_handle_refs,
+        ));
+    }
+    let header_counter_unique: BTreeSet<u32> =
+        objects.counter_unique_image_handles.iter().copied().collect();
+    if walked_counter_unique_handles != header_counter_unique {
+        let only_walked: Vec<u32> = walked_counter_unique_handles
+            .difference(&header_counter_unique)
+            .copied()
+            .collect();
+        let only_header: Vec<u32> = header_counter_unique
+            .difference(&walked_counter_unique_handles)
+            .copied()
+            .collect();
+        failures.push(format!(
+            "walked Counter unique image handles ({}) != header counter_unique_image_handles ({}). \
+             only-walked={:?} only-header={:?}",
+            walked_counter_unique_handles.len(),
+            header_counter_unique.len(),
+            only_walked,
+            only_header,
+        ));
+    }
+
     // Surface the deferred-chunk antibody signal.
     if !objects.deferred_sub_chunk_ids_seen.is_empty() {
         println!(
             "[deferred] sub_chunk_ids_seen = {:?} (signal: parser left these undecoded — \
-             will drop to [] when Counter/Non-Active body decoders ship)",
+             will drop to [] when Backdrop/Text/Extension body decoders ship)",
             objects.deferred_sub_chunk_ids_seen,
         );
     }
 
     println!();
-    println!("[typed pass] envelope OK         : {envelope_ok} / {}", objects.count);
+    println!("[typed pass] envelope OK              : {envelope_ok} / {}", objects.count);
     println!(
-        "[typed pass] Active inner OK     : {active_typed_ok} / {}",
+        "[typed pass] Active inner OK          : {active_typed_ok} / {}",
         objects.active_count,
     );
     println!(
-        "[typed pass] non-Active null OK  : {nonactive_null_ok} / {nonactive_total}",
+        "[typed pass] Counter inner OK         : {counter_typed_ok} / {}",
+        objects.counter_count,
     );
     println!(
-        "[Active rollup] max_anim_items={} total_directions={} total_frames={} \
+        "[typed pass] non-(Active|Counter) OK  : {nonactive_null_ok} / {nonactive_total}",
+    );
+    println!(
+        "[Active rollup]  max_anim_items={} total_directions={} total_frames={} \
          unique_handles_summed={}",
         active_max_anim_items,
         active_total_directions,
         active_total_frames,
         active_total_unique_handles,
+    );
+    println!(
+        "[Counter rollup] total_handle_refs={} unique_handles={}",
+        walked_counter_total_handle_refs,
+        walked_counter_unique_handles.len(),
     );
 
     println!();
