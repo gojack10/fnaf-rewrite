@@ -20,11 +20,13 @@
 pub mod active_scalars;
 pub mod alterables;
 pub mod counters;
+pub mod frame_transition;
 pub mod group_flags;
 pub mod sound_channels;
 
 pub use active_scalars::{ActiveScalars, ActiveState};
 pub use alterables::{Alterables, InstanceId, SLOT_COUNT};
 pub use counters::Counters;
+pub use frame_transition::{FrameId, FrameTransition, PendingFrameTransition};
 pub use group_flags::{GroupFlags, GroupId, GroupState};
 pub use sound_channels::{ChannelId, ChannelState, SoundChannels, MAX_VOLUME};
