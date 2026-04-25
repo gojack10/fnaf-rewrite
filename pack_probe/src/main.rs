@@ -5,9 +5,12 @@
 // Phase B: minimal typed deserialization at THREE levels of strictness:
 //          (1) envelope on every object — catches header/envelope drift,
 //          (2) per-object_type inner deserialize:
-//                - Active (124): full ActiveTyped (animations + summary),
-//                - Counter (44): CounterPropertiesSummary (display_style + handles),
-//                - non-(Active|Counter) (28): assert "no decode yet" null pattern.
+//                - Active   (124): full ActiveTyped (animations + summary),
+//                - Counter  (44):  CounterPropertiesSummary (display_style + handles),
+//                - Backdrop (15):  BackdropPropertiesSummary (obstacle/collision
+//                                  + width/height + image_handle),
+//                - non-(Active|Counter|Backdrop) (13): assert "no decode yet"
+//                                  null pattern.
 //          Catalog every failure as a probe target back on the parser side.
 //
 // NOT a real runtime. No game logic. Read-and-introspect only.
@@ -65,6 +68,8 @@ fn phase_a_untyped(manifest_path: &Path, objects_path: &Path) -> Result<()> {
         "counter_count",
         "counter_decoded_count",
         "counter_total_handle_refs",
+        "backdrop_count",
+        "backdrop_decoded_count",
         "count",
     ] {
         if let Some(v) = objects_doc.get(key) {
@@ -164,6 +169,9 @@ struct ObjectsFile {
     counter_decoded_count: u32,
     counter_total_handle_refs: u32,
     counter_unique_image_handles: Vec<u32>,
+    backdrop_count: u32,
+    backdrop_decoded_count: u32,
+    backdrop_unique_image_handles: Vec<u32>,
     count: u32,
     #[serde(default)]
     deferred_sub_chunk_ids_seen: Vec<String>,
@@ -290,6 +298,24 @@ struct CounterPropertiesSummary {
     unique_image_handles: Vec<u32>,
 }
 
+// ---- Backdrop-specific inner shape ----
+//
+// FNAF 1 Backdrop property body decodes into a fixed 18-byte struct:
+// u32 size + u16 obstacle_type + u16 collision_type + u32 width +
+// u32 height + u16 image_handle. The per-object `properties_summary`
+// surfaces every field — there are no opaque raw spans.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct BackdropPropertiesSummary {
+    size: u32,
+    obstacle_type: u32,
+    collision_type: u32,
+    width: u32,
+    height: u32,
+    image_handle: u32,
+}
+
 fn phase_b_typed(objects_path: &Path) -> Result<()> {
     println!("--- Phase B: typed deserialization ---");
 
@@ -362,6 +388,7 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     let mut envelope_ok = 0_u32;
     let mut active_typed_ok = 0_u32;
     let mut counter_typed_ok = 0_u32;
+    let mut backdrop_typed_ok = 0_u32;
     let mut nonactive_null_ok = 0_u32;
 
     // Accumulate Active-side stats once typed deserialization succeeds.
@@ -374,6 +401,9 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     // Accumulate Counter-side stats once typed deserialization succeeds.
     let mut walked_counter_total_handle_refs = 0_u32;
     let mut walked_counter_unique_handles: BTreeSet<u32> = BTreeSet::new();
+
+    // Accumulate Backdrop-side stats once typed deserialization succeeds.
+    let mut walked_backdrop_unique_handles: BTreeSet<u32> = BTreeSet::new();
 
     for raw in &objects.objects {
         // (1) envelope
@@ -571,8 +601,78 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                 }
                 counter_typed_ok += 1;
             }
+            1 => {
+                // Backdrop — typed inner expected (decoder shipped 2026-04-25).
+                // animations must be null (Backdrop has no animation table);
+                // properties_summary must typed-deserialize as
+                // BackdropPropertiesSummary.
+                if !envelope.properties_decoded {
+                    failures.push(format!(
+                        "Backdrop handle={} name={:?} has properties_decoded=false (expected true)",
+                        envelope.handle, envelope.name,
+                    ));
+                    continue;
+                }
+                if envelope.animations.is_some() {
+                    failures.push(format!(
+                        "Backdrop handle={} name={:?} has animations present (expected null)",
+                        envelope.handle, envelope.name,
+                    ));
+                }
+                let summary_v = match envelope.properties_summary.as_ref() {
+                    Some(v) => v,
+                    None => {
+                        failures.push(format!(
+                            "Backdrop handle={} name={:?} has properties_summary=null",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let summary: BackdropPropertiesSummary =
+                    match serde_json::from_value(summary_v.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            failures.push(format!(
+                                "Backdrop handle={} name={:?} properties_summary typed deser failed: {e}",
+                                envelope.handle, envelope.name,
+                            ));
+                            continue;
+                        }
+                    };
+
+                // FNAF 1 contract: every Backdrop has obstacle=None(0)
+                // and collision=Fine(0). A non-zero would indicate the
+                // designer used Clickteam's backdrop-obstacle layer for
+                // gameplay collision — surfacing the regression here is
+                // load-bearing because the renderer/runtime currently
+                // ignores the obstacle layer entirely.
+                if summary.obstacle_type != 0 {
+                    failures.push(format!(
+                        "Backdrop handle={} name={:?} unexpected obstacle_type={} (FNAF 1 should be 0=None)",
+                        envelope.handle, envelope.name, summary.obstacle_type,
+                    ));
+                }
+                if summary.collision_type != 0 {
+                    failures.push(format!(
+                        "Backdrop handle={} name={:?} unexpected collision_type={} (FNAF 1 should be 0=Fine)",
+                        envelope.handle, envelope.name, summary.collision_type,
+                    ));
+                }
+                // size mirror sanity: every FNAF 1 Backdrop is exactly 18 bytes.
+                if summary.size != 18 {
+                    failures.push(format!(
+                        "Backdrop handle={} name={:?} size={} (FNAF 1 should be 18)",
+                        envelope.handle, envelope.name, summary.size,
+                    ));
+                }
+
+                walked_backdrop_unique_handles.insert(summary.image_handle);
+                backdrop_typed_ok += 1;
+            }
             _ => {
-                // Non-(Active|Counter) — no decoder shipped yet. Assert the null pattern.
+                // Non-(Active|Counter|Backdrop) — no decoder shipped yet.
+                // Assert the null pattern.
                 let mut pattern_failures = Vec::new();
                 if envelope.properties_decoded {
                     pattern_failures.push("properties_decoded=true");
@@ -587,9 +687,9 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                     nonactive_null_ok += 1;
                 } else {
                     // This is the GOOD trigger — when parser ships decoders for
-                    // Backdrop/Text/Extension, this fires. Re-flag as "type new structs."
+                    // Text/Extension, this fires. Re-flag as "type new structs."
                     failures.push(format!(
-                        "non-(Active|Counter) type={} ({}) handle={} name={:?} broke null-pattern: {} \
+                        "non-(Active|Counter|Backdrop) type={} ({}) handle={} name={:?} broke null-pattern: {} \
                          — TIME TO ADD TYPED STRUCTS FOR THIS TYPE",
                         envelope.object_type,
                         envelope.object_type_name,
@@ -630,10 +730,28 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
             counter_typed_ok, objects.counter_count,
         ));
     }
-    let nonactive_total = objects.count - objects.active_count - objects.counter_count;
+    if objects.backdrop_count != 15 {
+        failures.push(format!("backdrop_count={} expected 15", objects.backdrop_count));
+    }
+    if objects.backdrop_decoded_count != objects.backdrop_count {
+        failures.push(format!(
+            "backdrop_decoded_count={} != backdrop_count={}",
+            objects.backdrop_decoded_count, objects.backdrop_count,
+        ));
+    }
+    if backdrop_typed_ok != objects.backdrop_count {
+        failures.push(format!(
+            "Backdrop typed-pass parsed {} of {} backdrops",
+            backdrop_typed_ok, objects.backdrop_count,
+        ));
+    }
+    let nonactive_total = objects.count
+        - objects.active_count
+        - objects.counter_count
+        - objects.backdrop_count;
     if nonactive_null_ok != nonactive_total {
         failures.push(format!(
-            "non-(Active|Counter) null-pattern matched {} of {} remaining",
+            "non-(Active|Counter|Backdrop) null-pattern matched {} of {} remaining",
             nonactive_null_ok, nonactive_total,
         ));
     }
@@ -700,6 +818,31 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         ));
     }
 
+    // Backdrop rollup cross-checks.
+    let header_backdrop_unique: BTreeSet<u32> = objects
+        .backdrop_unique_image_handles
+        .iter()
+        .copied()
+        .collect();
+    if walked_backdrop_unique_handles != header_backdrop_unique {
+        let only_walked: Vec<u32> = walked_backdrop_unique_handles
+            .difference(&header_backdrop_unique)
+            .copied()
+            .collect();
+        let only_header: Vec<u32> = header_backdrop_unique
+            .difference(&walked_backdrop_unique_handles)
+            .copied()
+            .collect();
+        failures.push(format!(
+            "walked Backdrop unique image handles ({}) != header backdrop_unique_image_handles ({}). \
+             only-walked={:?} only-header={:?}",
+            walked_backdrop_unique_handles.len(),
+            header_backdrop_unique.len(),
+            only_walked,
+            only_header,
+        ));
+    }
+
     // Surface the deferred-chunk antibody signal.
     if !objects.deferred_sub_chunk_ids_seen.is_empty() {
         println!(
@@ -710,20 +853,24 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     }
 
     println!();
-    println!("[typed pass] envelope OK              : {envelope_ok} / {}", objects.count);
+    println!("[typed pass] envelope OK                       : {envelope_ok} / {}", objects.count);
     println!(
-        "[typed pass] Active inner OK          : {active_typed_ok} / {}",
+        "[typed pass] Active inner OK                   : {active_typed_ok} / {}",
         objects.active_count,
     );
     println!(
-        "[typed pass] Counter inner OK         : {counter_typed_ok} / {}",
+        "[typed pass] Counter inner OK                  : {counter_typed_ok} / {}",
         objects.counter_count,
     );
     println!(
-        "[typed pass] non-(Active|Counter) OK  : {nonactive_null_ok} / {nonactive_total}",
+        "[typed pass] Backdrop inner OK                 : {backdrop_typed_ok} / {}",
+        objects.backdrop_count,
     );
     println!(
-        "[Active rollup]  max_anim_items={} total_directions={} total_frames={} \
+        "[typed pass] non-(Active|Counter|Backdrop) OK  : {nonactive_null_ok} / {nonactive_total}",
+    );
+    println!(
+        "[Active rollup]   max_anim_items={} total_directions={} total_frames={} \
          unique_handles_summed={}",
         active_max_anim_items,
         active_total_directions,
@@ -731,9 +878,13 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         active_total_unique_handles,
     );
     println!(
-        "[Counter rollup] total_handle_refs={} unique_handles={}",
+        "[Counter rollup]  total_handle_refs={} unique_handles={}",
         walked_counter_total_handle_refs,
         walked_counter_unique_handles.len(),
+    );
+    println!(
+        "[Backdrop rollup] unique_handles={}",
+        walked_backdrop_unique_handles.len(),
     );
 
     println!();
