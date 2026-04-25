@@ -2,12 +2,16 @@
 //
 // Phase A: untyped serde_json::Value walk. Print top-level shape, object_type
 //          histogram, and one full sample object per object_type.
-// Phase B: minimal typed deserialization. Catalog every serde failure as a
-//          probe target back on the parser side.
+// Phase B: minimal typed deserialization at TWO levels of strictness:
+//          (1) envelope on every object — catches header/envelope drift,
+//          (2) per-object_type inner deserialize:
+//                - Active (124): full ActiveTyped (animations + summary),
+//                - non-Active (72): assert "no decode yet" null pattern.
+//          Catalog every failure as a probe target back on the parser side.
 //
 // NOT a real runtime. No game logic. Read-and-introspect only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -151,8 +155,11 @@ struct ObjectsFile {
     active_decoded_count: u32,
     active_animation_frames: u32,
     active_animation_directions: u32,
+    active_unique_image_handles: Vec<u32>,
     count: u32,
-    objects: Vec<Value>, // intentionally untyped — inner pass is future work
+    #[serde(default)]
+    deferred_sub_chunk_ids_seen: Vec<String>,
+    objects: Vec<Value>, // walked again below as typed envelopes / typed inner
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,8 +172,102 @@ struct Manifest {
     files: BTreeMap<String, Value>,
 }
 
+// ---- Object envelope (shared by all 7 object_types) ----
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct ObjectEnvelope {
+    handle: u32,
+    header: ObjectHeader,
+    name: String,
+    object_type: u32,
+    object_type_name: String,
+    properties_decoded: bool,
+    properties_len: u32,
+    properties_summary: Option<Value>, // typed per-object_type below
+    animations: Option<Value>,         // typed per-object_type below
+    effects_len: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct ObjectHeader {
+    antialias: bool,
+    flags: u32,
+    handle: u32,
+    ink_effect: u32,
+    ink_effect_id: u32,
+    ink_effect_param: u32,
+    object_type: u32,
+    object_type_name: String,
+    reserved: i32, // can be negative, e.g. Text reserved=-16
+    transparent: bool,
+}
+
+// ---- Active-specific inner shape ----
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct ActiveAnimations {
+    items: Vec<Animation>,
+    summary: AnimationsSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct Animation {
+    animation_index: u32,
+    animation_name: String,
+    directions: Vec<Direction>,
+    image_handles: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct Direction {
+    back_to: u32,
+    direction_index: u32,
+    frame_count: u32,
+    image_handles: Vec<u32>,
+    max_speed: u32,
+    min_speed: u32,
+    repeat: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct AnimationsSummary {
+    non_empty_animations: u32,
+    total_animations: u32,
+    total_directions: u32,
+    total_frames: u32,
+    unique_image_handles: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct ActivePropertiesSummary {
+    known_zero_pad_gaps: u32,
+    movements_decoded: bool,
+    movements_raw_len: u32,
+    non_empty_animations: u32,
+    opaque_tables: BTreeMap<String, u32>,
+    total_animations: u32,
+    total_directions: u32,
+    total_frames: u32,
+    unconsumed_gap_count: u32,
+    unique_image_handles: Vec<u32>,
+}
+
 fn phase_b_typed(objects_path: &Path) -> Result<()> {
-    println!("--- Phase B: typed envelope deserialization ---");
+    println!("--- Phase B: typed deserialization ---");
 
     let manifest_raw = fs::read_to_string(Path::new(PACK_DIR).join("manifest.json"))?;
     let objects_raw = fs::read_to_string(objects_path)?;
@@ -195,8 +296,10 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         objects.objects.len(),
     );
 
-    // Oracle assertions (Layer 1 — deterministic).
-    let mut failures = Vec::new();
+    // Failure catalog — every entry is a parser-side probe target.
+    let mut failures: Vec<String> = Vec::new();
+
+    // ---- Layer-1 envelope counts ----
     if objects.active_count != 124 {
         failures.push(format!("active_count={} expected 124", objects.active_count));
     }
@@ -219,6 +322,280 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
             objects.count,
         ));
     }
+
+    // ---- Per-object typed walk ----
+    //
+    // 1. Every object → ObjectEnvelope (deny_unknown_fields). Catches schema drift
+    //    on the shared shape (handle/header/name/object_type/...).
+    // 2. Active (object_type==2) → ActiveAnimations + ActivePropertiesSummary
+    //    (deny_unknown_fields). Catches drift in the rich Active inner shape.
+    // 3. Non-Active (other types) → must currently match the "no decode yet"
+    //    null pattern: properties_decoded=false, properties_summary=null,
+    //    animations=null. When parser ships Counter/Backdrop/Text/Extension
+    //    decoders, this assertion will start failing — that's the trigger to
+    //    add typed structs for those types.
+
+    let mut envelope_ok = 0_u32;
+    let mut active_typed_ok = 0_u32;
+    let mut nonactive_null_ok = 0_u32;
+
+    // Accumulate Active-side stats once typed deserialization succeeds.
+    let mut active_max_anim_items = 0_u32;
+    let mut active_total_directions = 0_u32;
+    let mut active_total_frames = 0_u32;
+    let mut active_total_unique_handles = 0_u32;
+    let mut walked_active_unique_handles: BTreeSet<u32> = BTreeSet::new();
+
+    for raw in &objects.objects {
+        // (1) envelope
+        let envelope: ObjectEnvelope = match serde_json::from_value(raw.clone()) {
+            Ok(e) => {
+                envelope_ok += 1;
+                e
+            }
+            Err(err) => {
+                let handle = raw.get("handle").map(|v| v.to_string()).unwrap_or_default();
+                let name = raw.get("name").and_then(Value::as_str).unwrap_or("?");
+                failures.push(format!(
+                    "envelope deserialize failed (handle={handle} name={name:?}): {err}"
+                ));
+                continue;
+            }
+        };
+
+        // Cross-check: header.object_type / header.handle should match envelope.
+        if envelope.header.object_type != envelope.object_type {
+            failures.push(format!(
+                "header.object_type={} != envelope.object_type={} (handle={} name={:?})",
+                envelope.header.object_type,
+                envelope.object_type,
+                envelope.handle,
+                envelope.name,
+            ));
+        }
+        if envelope.header.handle != envelope.handle {
+            failures.push(format!(
+                "header.handle={} != envelope.handle={} (name={:?})",
+                envelope.header.handle, envelope.handle, envelope.name,
+            ));
+        }
+
+        // (2) per-object_type inner
+        match envelope.object_type {
+            2 => {
+                // Active — full typed inner expected.
+                if !envelope.properties_decoded {
+                    failures.push(format!(
+                        "Active handle={} name={:?} has properties_decoded=false (expected true)",
+                        envelope.handle, envelope.name,
+                    ));
+                    continue;
+                }
+                let anims_v = match envelope.animations.as_ref() {
+                    Some(v) => v,
+                    None => {
+                        failures.push(format!(
+                            "Active handle={} name={:?} has animations=null",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let summary_v = match envelope.properties_summary.as_ref() {
+                    Some(v) => v,
+                    None => {
+                        failures.push(format!(
+                            "Active handle={} name={:?} has properties_summary=null",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let anims: ActiveAnimations = match serde_json::from_value(anims_v.clone()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        failures.push(format!(
+                            "Active handle={} name={:?} animations typed deser failed: {e}",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let summary: ActivePropertiesSummary =
+                    match serde_json::from_value(summary_v.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            failures.push(format!(
+                                "Active handle={} name={:?} properties_summary typed deser failed: {e}",
+                                envelope.handle, envelope.name,
+                            ));
+                            continue;
+                        }
+                    };
+
+                // Cross-check: summary stats vs items walk.
+                // animations.items contains ONLY non-empty animation slots
+                // (vanilla Active has 16 slots, most are empty). So walked items
+                // must equal non_empty_animations, not total_animations.
+                let walked_items = anims.items.len() as u32;
+                let walked_dirs: u32 = anims.items.iter().map(|a| a.directions.len() as u32).sum();
+                let walked_frames: u32 = anims
+                    .items
+                    .iter()
+                    .flat_map(|a| a.directions.iter())
+                    .map(|d| d.frame_count)
+                    .sum();
+                if walked_items != summary.non_empty_animations {
+                    failures.push(format!(
+                        "Active handle={} name={:?} animations.items.len()={} != properties_summary.non_empty_animations={}",
+                        envelope.handle, envelope.name, walked_items, summary.non_empty_animations,
+                    ));
+                }
+                if anims.summary.non_empty_animations != summary.non_empty_animations {
+                    failures.push(format!(
+                        "Active handle={} name={:?} animations.summary.non_empty_animations={} != properties_summary.non_empty_animations={}",
+                        envelope.handle,
+                        envelope.name,
+                        anims.summary.non_empty_animations,
+                        summary.non_empty_animations,
+                    ));
+                }
+                if walked_dirs != summary.total_directions {
+                    failures.push(format!(
+                        "Active handle={} name={:?} walked directions={} != properties_summary.total_directions={}",
+                        envelope.handle, envelope.name, walked_dirs, summary.total_directions,
+                    ));
+                }
+                if walked_frames != summary.total_frames {
+                    failures.push(format!(
+                        "Active handle={} name={:?} walked frames={} != properties_summary.total_frames={}",
+                        envelope.handle, envelope.name, walked_frames, summary.total_frames,
+                    ));
+                }
+
+                active_max_anim_items = active_max_anim_items.max(walked_items);
+                active_total_directions += walked_dirs;
+                active_total_frames += walked_frames;
+                active_total_unique_handles += summary.unique_image_handles.len() as u32;
+                for d in anims.items.iter().flat_map(|a| a.directions.iter()) {
+                    for h in &d.image_handles {
+                        walked_active_unique_handles.insert(*h);
+                    }
+                }
+                active_typed_ok += 1;
+            }
+            _ => {
+                // Non-Active — no decoder shipped yet. Assert the null pattern.
+                let mut pattern_failures = Vec::new();
+                if envelope.properties_decoded {
+                    pattern_failures.push("properties_decoded=true");
+                }
+                if envelope.properties_summary.is_some() {
+                    pattern_failures.push("properties_summary present");
+                }
+                if envelope.animations.is_some() {
+                    pattern_failures.push("animations present");
+                }
+                if pattern_failures.is_empty() {
+                    nonactive_null_ok += 1;
+                } else {
+                    // This is the GOOD trigger — when parser ships decoders for
+                    // this type, this fires. Re-flag as "type new structs."
+                    failures.push(format!(
+                        "non-Active type={} ({}) handle={} name={:?} broke null-pattern: {} \
+                         — TIME TO ADD TYPED STRUCTS FOR THIS TYPE",
+                        envelope.object_type,
+                        envelope.object_type_name,
+                        envelope.handle,
+                        envelope.name,
+                        pattern_failures.join(", "),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ---- Layer-1 typed-pass assertions ----
+    if envelope_ok != objects.count {
+        failures.push(format!(
+            "envelope-typed pass parsed {} of {} objects",
+            envelope_ok, objects.count,
+        ));
+    }
+    if active_typed_ok != objects.active_count {
+        failures.push(format!(
+            "Active typed-pass parsed {} of {} actives",
+            active_typed_ok, objects.active_count,
+        ));
+    }
+    let nonactive_total = objects.count - objects.active_count;
+    if nonactive_null_ok != nonactive_total {
+        failures.push(format!(
+            "non-Active null-pattern matched {} of {} non-actives",
+            nonactive_null_ok, nonactive_total,
+        ));
+    }
+
+    // Cross-check: header rollup counts == walked rollup counts.
+    if active_total_directions != objects.active_animation_directions {
+        failures.push(format!(
+            "walked Active directions={} != header active_animation_directions={}",
+            active_total_directions, objects.active_animation_directions,
+        ));
+    }
+    if active_total_frames != objects.active_animation_frames {
+        failures.push(format!(
+            "walked Active frames={} != header active_animation_frames={}",
+            active_total_frames, objects.active_animation_frames,
+        ));
+    }
+    let header_unique: BTreeSet<u32> =
+        objects.active_unique_image_handles.iter().copied().collect();
+    if walked_active_unique_handles != header_unique {
+        let only_walked: Vec<u32> = walked_active_unique_handles
+            .difference(&header_unique)
+            .copied()
+            .collect();
+        let only_header: Vec<u32> = header_unique
+            .difference(&walked_active_unique_handles)
+            .copied()
+            .collect();
+        failures.push(format!(
+            "walked Active unique image handles ({}) != header active_unique_image_handles ({}). \
+             only-walked={:?} only-header={:?}",
+            walked_active_unique_handles.len(),
+            header_unique.len(),
+            only_walked,
+            only_header,
+        ));
+    }
+
+    // Surface the deferred-chunk antibody signal.
+    if !objects.deferred_sub_chunk_ids_seen.is_empty() {
+        println!(
+            "[deferred] sub_chunk_ids_seen = {:?} (signal: parser left these undecoded — \
+             will drop to [] when Counter/Non-Active body decoders ship)",
+            objects.deferred_sub_chunk_ids_seen,
+        );
+    }
+
+    println!();
+    println!("[typed pass] envelope OK         : {envelope_ok} / {}", objects.count);
+    println!(
+        "[typed pass] Active inner OK     : {active_typed_ok} / {}",
+        objects.active_count,
+    );
+    println!(
+        "[typed pass] non-Active null OK  : {nonactive_null_ok} / {nonactive_total}",
+    );
+    println!(
+        "[Active rollup] max_anim_items={} total_directions={} total_frames={} \
+         unique_handles_summed={}",
+        active_max_anim_items,
+        active_total_directions,
+        active_total_frames,
+        active_total_unique_handles,
+    );
 
     println!();
     if failures.is_empty() {
