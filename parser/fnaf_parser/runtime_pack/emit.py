@@ -50,6 +50,7 @@ from fnaf_parser.compression import read_chunk_payload
 from fnaf_parser.decoders.frame import decode_frame
 from fnaf_parser.decoders.frame_items import (
     OBJECT_TYPE_ACTIVE,
+    OBJECT_TYPE_COUNTER,
     decode_frame_items,
     object_type_name,
 )
@@ -170,11 +171,25 @@ def _animation_to_runtime_dict(animation: Any) -> dict[str, Any]:
 
 
 def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
-    """Serialize one ObjectInfo for the runtime object bank."""
-    decoded = obj.properties is not None
+    """Serialize one ObjectInfo for the runtime object bank.
+
+    Per-type body dispatch:
+
+    * Active (object_type=2) → ``obj.properties`` is an ``ObjectCommon``;
+      emit Active animation summary + flattened animation items.
+    * Counter (object_type=7) → ``obj.counter`` is a ``CounterBody``;
+      emit display-style + image-handle list summary.
+    * Other types (Backdrop, Text, Extension) → no decoded body yet;
+      ``properties_decoded=false`` and ``properties_summary=null``. The
+      Rust pack_probe non-Active null-pattern oracle relies on this
+      contract to fire the schema-drift tripwire when a new body decoder
+      ships.
+    """
+    decoded = (obj.properties is not None) or (obj.counter is not None)
     animations = None
-    properties_summary = None
-    if decoded:
+    properties_summary: dict[str, Any] | None = None
+
+    if obj.properties is not None:
         properties_summary = obj.properties.summary
         if obj.properties.animations is not None:
             animations = {
@@ -185,6 +200,8 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
                     if animation.directions
                 ],
             }
+    elif obj.counter is not None:
+        properties_summary = obj.counter.summary_dict()
 
     return {
         "handle": obj.handle,
@@ -203,10 +220,11 @@ def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
 def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
     """Serialize the pack-level ObjectInfo bank.
 
-    Active objects carry decoded ObjectCommon animation tables. Other
-    object types intentionally remain raw in V0 (``properties_decoded``
-    false) so downstream code can distinguish "not present" from
-    "present but deferred by scope".
+    Active objects carry decoded ObjectCommon animation tables. Counter
+    objects carry decoded display-style + image-handle list. Other
+    object types (Backdrop, Text, Extension) intentionally remain raw
+    in V0 (``properties_decoded=false``) so downstream code can
+    distinguish "not present" from "present but deferred by scope".
     """
     objects = [_object_info_to_runtime_dict(obj) for obj in frame_items.items]
     active_objects = [
@@ -231,6 +249,25 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
             for handle in obj.properties.image_handles
         }
     )
+
+    counter_objects = [
+        obj for obj in frame_items.items if obj.object_type == OBJECT_TYPE_COUNTER
+    ]
+    counter_decoded = [obj for obj in counter_objects if obj.counter is not None]
+    counter_total_handle_refs = sum(
+        obj.counter.image_handle_count
+        for obj in counter_decoded
+        if obj.counter is not None
+    )
+    unique_counter_image_handles = sorted(
+        {
+            handle
+            for obj in counter_decoded
+            if obj.counter is not None
+            for handle in obj.counter.image_handles
+        }
+    )
+
     return {
         "count": frame_items.count,
         "active_count": len(active_objects),
@@ -238,6 +275,10 @@ def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
         "active_animation_frames": total_active_frames,
         "active_animation_directions": total_active_directions,
         "active_unique_image_handles": unique_active_image_handles,
+        "counter_count": len(counter_objects),
+        "counter_decoded_count": len(counter_decoded),
+        "counter_total_handle_refs": counter_total_handle_refs,
+        "counter_unique_image_handles": unique_counter_image_handles,
         "deferred_sub_chunk_ids_seen": sorted(
             f"0x{cid:04X}" for cid in frame_items.deferred_sub_chunk_ids_seen
         ),
@@ -378,6 +419,14 @@ def _build_master_manifest(
             ],
             "active_unique_image_handles": len(
                 object_bank_summary["active_unique_image_handles"]
+            ),
+            "counter_objects": object_bank_summary["counter_count"],
+            "counter_decoded_objects": object_bank_summary["counter_decoded_count"],
+            "counter_total_handle_refs": object_bank_summary[
+                "counter_total_handle_refs"
+            ],
+            "counter_unique_image_handles": len(
+                object_bank_summary["counter_unique_image_handles"]
             ),
         },
     }

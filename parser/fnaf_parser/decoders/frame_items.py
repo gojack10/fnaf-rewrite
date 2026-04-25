@@ -85,12 +85,13 @@ Antibody coverage
   sub-chunk ids whose bodies were NOT structurally decoded (i.e. genuinely
   need a follow-up decoder). 0x4446 (Properties) is added only when its
   body is present but unconsumed — Active bodies that decode through
-  `decode_object_common` are NOT marked deferred. Empirically on FNAF 1
-  this set still contains `{0x4446}` because 72 non-Active ObjectInfos
-  (Backdrops, Texts, Counters, Extensions) carry undecoded property
-  bodies pending the Counter / Non-Active body decoder track. Any other
-  id that made it through Antibody #1 but wasn't decoded is listed
-  there for the follow-up probe to triage.
+  `decode_object_common` and Counter bodies that decode through
+  `decode_counter_body` are NOT marked deferred. Empirically on FNAF 1
+  this set still contains `{0x4446}` because 28 non-(Active|Counter)
+  ObjectInfos (Backdrops, Texts, Extensions) carry undecoded property
+  bodies pending the Non-Active body decoder track. Any other id that
+  made it through Antibody #1 but wasn't decoded is listed there for
+  the follow-up probe to triage.
 - #7 snapshot: (count, sorted-handles-sample, object-type histogram)
   pinned in tests.
 """
@@ -102,6 +103,11 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.counter_body import (
+    CounterBody,
+    CounterBodyDecodeError,
+    decode_counter_body,
+)
 from fnaf_parser.decoders.object_common import (
     ObjectCommon,
     ObjectCommonDecodeError,
@@ -302,8 +308,11 @@ class ObjectInfo:
     was absent (so round-trip can distinguish absent-vs-empty via
     `sub_records`). For Active objects, `properties` carries the decoded
     ObjectCommon body when `decode_frame_items(..., decode_active_properties=True)`
-    is used. Other object types stay raw until their body shapes are
-    probed separately.
+    is used. For Counter objects (object_type=7), `counter` carries the
+    decoded CounterBody when `decode_counter_properties=True`. The two
+    decoded-body fields are mutually exclusive — at most one is non-None
+    per ObjectInfo. Other object types (Backdrop, Text, Extension) stay
+    raw until their body shapes are probed separately.
     """
     header: ObjectHeader
     name: str | None
@@ -311,6 +320,7 @@ class ObjectInfo:
     effects_raw: bytes = field(repr=False)
     sub_records: tuple[ObjectInfoSubChunkRecord, ...]
     properties: ObjectCommon | None = field(default=None, repr=False)
+    counter: CounterBody | None = field(default=None, repr=False)
 
     @property
     def handle(self) -> int:
@@ -321,14 +331,19 @@ class ObjectInfo:
         return self.header.object_type
 
     def as_dict(self) -> dict:
+        body_decoded = (self.properties is not None) or (self.counter is not None)
+        if self.properties is not None:
+            body_dict: dict | None = self.properties.as_dict()
+        elif self.counter is not None:
+            body_dict = self.counter.as_dict()
+        else:
+            body_dict = None
         return {
             "header": self.header.as_dict(),
             "name": self.name,
             "properties_len": len(self.properties_raw),
-            "properties_decoded": self.properties is not None,
-            "properties": (
-                self.properties.as_dict() if self.properties is not None else None
-            ),
+            "properties_decoded": body_decoded,
+            "properties": body_dict,
             "effects_len": len(self.effects_raw),
             "sub_chunks": [
                 {
@@ -359,12 +374,13 @@ class FrameItems:
     `deferred_sub_chunk_ids_seen` is the set of inner sub-chunk ids whose
     bodies were not structurally decoded by this probe (i.e. still need a
     follow-up decoder). 0x4446 is added only when its body is present but
-    not consumed — Actives whose bodies decode via `decode_object_common`
-    are NOT marked deferred. On FNAF 1 the set still contains 0x4446
-    because 72 non-Active ObjectInfos (Backdrops, Texts, Counters,
-    Extensions) carry undecoded property bodies, and 0x4448 because no
-    Effects decoder exists yet. Drops to empty once every body sub-chunk
-    has a structured decoder.
+    not consumed — Actives that decode via `decode_object_common` and
+    Counters that decode via `decode_counter_body` are NOT marked
+    deferred. On FNAF 1 the set still contains 0x4446 because 28
+    non-(Active|Counter) ObjectInfos (Backdrops, Texts, Extensions) carry
+    undecoded property bodies, and 0x4448 because no Effects decoder
+    exists yet. Drops to empty once every body sub-chunk has a
+    structured decoder.
     """
     items: tuple[ObjectInfo, ...]
     deferred_encrypted: tuple[ObjectInfoSubChunkRecord, ...]
@@ -541,6 +557,7 @@ def _decode_one_object_info(
     deferred_sub_chunk_ids_seen: set[int],
     deferred_encrypted: list[ObjectInfoSubChunkRecord],
     decode_active_properties: bool,
+    decode_counter_properties: bool,
 ) -> tuple[ObjectInfo, int]:
     """Decode one ObjectInfo starting at `start` in the outer payload.
 
@@ -623,11 +640,28 @@ def _decode_one_object_info(
                 f"offset 0x{start:x}: {exc}"
             ) from exc
 
+    counter: CounterBody | None = None
+    if (
+        decode_counter_properties
+        and header.object_type == OBJECT_TYPE_COUNTER
+        and properties_raw
+    ):
+        try:
+            counter = decode_counter_body(properties_raw)
+        except CounterBodyDecodeError as exc:
+            raise FrameItemsDecodeError(
+                f"0x2229 FrameItems: Counter ObjectInfo handle={header.handle} "
+                f"name={name!r} has malformed Counter properties "
+                f"({len(properties_raw)} bytes) at ObjectInfo payload "
+                f"offset 0x{start:x}: {exc}"
+            ) from exc
+
     # Now that the (optional) decode has run, mark 0x4446 as deferred only when
     # the body was present but NOT structurally decoded. This keeps the
     # deferred set honest: it lists sub-chunk ids whose bodies still need a
     # follow-up decoder, not just "ids we saw on the wire".
-    if properties_raw and properties is None:
+    body_decoded = properties is not None or counter is not None
+    if properties_raw and not body_decoded:
         deferred_sub_chunk_ids_seen.add(SUB_OBJECT_PROPERTIES)
 
     return (
@@ -638,6 +672,7 @@ def _decode_one_object_info(
             effects_raw=effects_raw,
             sub_records=sub_records,
             properties=properties,
+            counter=counter,
         ),
         end,
     )
@@ -649,6 +684,7 @@ def decode_frame_items(
     unicode: bool = True,
     transform: TransformState | None = None,
     decode_active_properties: bool = True,
+    decode_counter_properties: bool = True,
 ) -> FrameItems:
     """Decode a 0x2229 FrameItems chunk's plaintext bytes.
 
@@ -663,8 +699,11 @@ def decode_frame_items(
 
     When `decode_active_properties` is true (the default), Active
     ObjectInfo 0x4446 bodies are decoded through `object_common.py` and
-    exposed as `ObjectInfo.properties`. Non-Active properties stay in
-    `properties_raw` only.
+    exposed as `ObjectInfo.properties`. When `decode_counter_properties`
+    is true (also the default), Counter ObjectInfo 0x4446 bodies are
+    decoded through `counter_body.py` and exposed as `ObjectInfo.counter`.
+    Other object types (Backdrop, Text, Extension) stay raw in
+    `properties_raw` until their body shapes are probed separately.
 
     Antibodies enforced:
 
@@ -714,6 +753,7 @@ def decode_frame_items(
             deferred_sub_chunk_ids_seen=deferred_sub_chunk_ids_seen,
             deferred_encrypted=deferred_encrypted,
             decode_active_properties=decode_active_properties,
+            decode_counter_properties=decode_counter_properties,
         )
 
         existing_idx = seen_handles.get(obj.handle)

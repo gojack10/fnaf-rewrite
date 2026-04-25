@@ -68,6 +68,9 @@ FNAF1_ACTIVE_ANIMATION_DIRECTIONS = 234
 FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES = 389
 FNAF1_IMAGE_COUNT = 605
 FNAF1_AUDIO_COUNT = 52
+FNAF1_COUNTER_COUNT = 44
+FNAF1_COUNTER_TOTAL_HANDLE_REFS = 607
+FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES = 201
 
 
 # --- Fixture ------------------------------------------------------------
@@ -217,6 +220,12 @@ def test_antibody_counts_are_self_consistent(_pack_out: Path) -> None:
     assert counts["active_unique_image_handles"] == (
         FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES
     )
+    assert counts["counter_objects"] == FNAF1_COUNTER_COUNT
+    assert counts["counter_decoded_objects"] == FNAF1_COUNTER_COUNT
+    assert counts["counter_total_handle_refs"] == FNAF1_COUNTER_TOTAL_HANDLE_REFS
+    assert counts["counter_unique_image_handles"] == (
+        FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES
+    )
 
     # Cross-check counts against the files list
     png_count = sum(1 for k in files if k.endswith(".png"))
@@ -258,14 +267,32 @@ def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None
     active = [
         obj for obj in object_bank["objects"] if obj["object_type_name"] == "Active"
     ]
-    non_active = [
-        obj for obj in object_bank["objects"] if obj["object_type_name"] != "Active"
+    counter = [
+        obj for obj in object_bank["objects"] if obj["object_type_name"] == "Counter"
+    ]
+    other = [
+        obj
+        for obj in object_bank["objects"]
+        if obj["object_type_name"] not in {"Active", "Counter"}
     ]
     assert len(active) == FNAF1_ACTIVE_COUNT
     assert all(obj["properties_decoded"] is True for obj in active)
     assert all(obj["animations"] is not None for obj in active)
-    assert all(obj["properties_decoded"] is False for obj in non_active)
-    assert all(obj["animations"] is None for obj in non_active)
+
+    # Counters now decode through `decode_counter_body`. They carry
+    # `properties_summary` (display_style + handle list) but NOT
+    # `animations` — that field stays Active-only.
+    assert len(counter) == FNAF1_COUNTER_COUNT
+    assert all(obj["properties_decoded"] is True for obj in counter)
+    assert all(obj["properties_summary"] is not None for obj in counter)
+    assert all(obj["animations"] is None for obj in counter)
+
+    # Backdrop / Text / Extension stay raw in V0. The Rust pack_probe's
+    # null-pattern oracle relies on this contract — when a new body
+    # decoder ships these flip and the oracle fires as the loop signal.
+    assert all(obj["properties_decoded"] is False for obj in other)
+    assert all(obj["properties_summary"] is None for obj in other)
+    assert all(obj["animations"] is None for obj in other)
 
     largest = next(obj for obj in object_bank["objects"] if obj["handle"] == 44)
     assert largest["name"] == "Active 3"

@@ -74,6 +74,17 @@ FNAF1_ACTIVE_ANIMATION_FRAMES = 511
 FNAF1_ACTIVE_ANIMATION_DIRECTIONS = 234
 FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES = 389
 
+# Counter inventory pinned by the 2026-04-25 wide-net session and the
+# Counter Body Decoder probe (probe.py / probe2.py under
+# parser/temp-probes/counter_body_2026_04_25/).
+FNAF1_COUNTER_COUNT = 44
+FNAF1_COUNTER_TOTAL_PROPERTIES_BYTES = 43 * 180 + 162  # 7902
+FNAF1_COUNTER_DISPLAY_STYLE_HISTOGRAM = {0: 29, 1: 8, 3: 4, 10: 2, 12: 1}
+FNAF1_COUNTER_TOTAL_HANDLE_REFS = 607
+FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES = 201
+FNAF1_COUNTER_BODY_SIZES = {180: 43, 162: 1}
+FNAF1_COUNTER_OUTLIER_NAME = "usage meter"  # 162-byte body, only one
+
 
 # --- Synthetic helpers ---------------------------------------------------
 
@@ -274,6 +285,7 @@ def test_roundtrip_multiple_object_infos_preserve_order():
         payload,
         unicode=True,
         decode_active_properties=False,
+        decode_counter_properties=False,
     )
     assert fi.count == 3
     assert [it.handle for it in fi.items] == [0, 1, 2]
@@ -656,6 +668,88 @@ def test_fnaf1_active_object_common_snapshot(fnaf1_image_bank):
     assert largest.properties.animations is not None
     assert largest.properties.animations.count == 76
     assert largest.properties.animations.total_frames == 176
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_counter_body_snapshot(fnaf1_image_bank):
+    """Antibody #9 (Counter Body Decoder, 2026-04-25): all 44 FNAF 1
+    Counter ObjectInfo bodies decode through `decode_counter_body`.
+
+    Pins:
+
+    * 44/44 Counters decode (``item.counter`` is populated).
+    * 43 baseline 180-byte bodies + 1 outlier 162-byte body
+      (handle 108 'usage meter').
+    * ``display_style`` histogram is exactly the wide-net inventory:
+      {0: 29, 1: 8, 3: 4, 10: 2, 12: 1}.
+    * Total handle references and unique handle count match the probe.
+    * Every counter image handle resolves into the sparse 605-record
+      ImageBank handle set (same sparse-handle rule as Actives — not
+      ``handle < image_count``).
+    * Sum of ``properties_raw`` byte counts across all counters equals
+      the empirical FNAF 1 byte budget (43 * 180 + 162).
+    """
+    blob, result, transform = _fnaf1_transform_and_records()
+    fi_rec = next(r for r in result.records if r.id == 0x2229)
+    payload = read_chunk_payload(blob, fi_rec, transform=transform)
+    fi = decode_frame_items(
+        payload, unicode=result.header.unicode, transform=transform
+    )
+
+    counters = [
+        item for item in fi.items if item.object_type == OBJECT_TYPE_COUNTER
+    ]
+    assert len(counters) == FNAF1_COUNTER_COUNT
+    assert all(item.counter is not None for item in counters)
+    # Counter and Active branches are mutually exclusive — Counters MUST
+    # NOT carry an Active ObjectCommon decode and vice-versa.
+    assert all(item.properties is None for item in counters)
+
+    body_size_hist: dict[int, int] = {}
+    for item in counters:
+        size = len(item.properties_raw)
+        body_size_hist[size] = body_size_hist.get(size, 0) + 1
+    assert body_size_hist == FNAF1_COUNTER_BODY_SIZES
+    assert sum(len(item.properties_raw) for item in counters) == (
+        FNAF1_COUNTER_TOTAL_PROPERTIES_BYTES
+    )
+
+    outliers = [c for c in counters if len(c.properties_raw) == 162]
+    assert len(outliers) == 1
+    assert outliers[0].name == FNAF1_COUNTER_OUTLIER_NAME
+
+    display_style_hist: dict[int, int] = {}
+    total_handle_refs = 0
+    unique_handles: set[int] = set()
+    for item in counters:
+        body = item.counter
+        assert body is not None
+        # size field round-trips to len(properties_raw)
+        assert body.size == len(item.properties_raw)
+        assert body.image_handle_count == len(body.image_handles)
+        display_style_hist[body.display_style] = (
+            display_style_hist.get(body.display_style, 0) + 1
+        )
+        total_handle_refs += body.image_handle_count
+        unique_handles.update(body.image_handles)
+    assert display_style_hist == FNAF1_COUNTER_DISPLAY_STYLE_HISTOGRAM
+    assert total_handle_refs == FNAF1_COUNTER_TOTAL_HANDLE_REFS
+    assert len(unique_handles) == FNAF1_COUNTER_UNIQUE_IMAGE_HANDLES
+
+    # Sparse-handle antibody: every counter image handle must be a
+    # member of the decoded ImageBank handle set, NOT just `handle <
+    # image_count`. Reuses the FNAF 1 antibody that bit Active animations.
+    missing_handles = sorted(unique_handles - fnaf1_image_bank.handles)
+    assert missing_handles == []
+    assert max(unique_handles) > 0
+
+    # 'night number' is a load-bearing fixture: ds=1 (digit display), 14
+    # sequential image handles for digit sprites. Pinning protects the
+    # decoder against silent shape drift on a real game-state counter.
+    night = next(c for c in counters if c.name == "night number")
+    assert night.counter is not None
+    assert night.counter.display_style == 1
+    assert night.counter.image_handle_count == 14
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
