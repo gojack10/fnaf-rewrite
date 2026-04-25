@@ -1,7 +1,8 @@
 """Regression tests for 0x2229 FrameItems decoder (probe #5).
 
-Top-level object-type bank. Envelope-only scope: header + name per
-ObjectInfo, Properties / Effects kept opaque.
+Top-level object-type bank. FrameItems decodes header + name for every
+ObjectInfo. Active Properties (0x4446) are decoded as ObjectCommon;
+non-Active Properties and Effects remain raw/opaque.
 
 Antibody coverage:
 
@@ -19,6 +20,9 @@ Antibody coverage:
   (0x4448 Effects absent — noted in the docstring.)
 - #7 snapshot: (count, object_type_histogram, sorted-handles-sample,
   first/last item (handle, object_type, name)) pinned below.
+- #8 ObjectCommon: all 124 Active property bodies decode, byte coverage
+  has only the known eight-zero-byte pad, and animation handles resolve
+  against the sparse 605-record ImageBank handle set.
 """
 
 from __future__ import annotations
@@ -52,12 +56,23 @@ from fnaf_parser.decoders.frame_items import (
     decode_frame_items,
     object_type_name,
 )
+from fnaf_parser.decoders.object_common import (
+    KNOWN_ZERO_PAD_BYTES,
+    KNOWN_ZERO_PAD_END,
+    KNOWN_ZERO_PAD_START,
+)
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import make_transform
 from fnaf_parser.pe_walker import FNAF1_DATA_PACK_START
 
 FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.exe"
 LAST_CHUNK_ID = 0x7F7F
+
+FNAF1_ACTIVE_COUNT = 124
+FNAF1_ACTIVE_TOTAL_PROPERTIES_BYTES = 36_988
+FNAF1_ACTIVE_ANIMATION_FRAMES = 511
+FNAF1_ACTIVE_ANIMATION_DIRECTIONS = 234
+FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES = 389
 
 
 # --- Synthetic helpers ---------------------------------------------------
@@ -213,7 +228,11 @@ def test_roundtrip_single_object_info():
             )
         ]
     )
-    fi = decode_frame_items(payload, unicode=True)
+    fi = decode_frame_items(
+        payload,
+        unicode=True,
+        decode_active_properties=False,
+    )
     assert fi.count == 1
     assert len(fi.items) == 1
     obj = fi.items[0]
@@ -229,6 +248,7 @@ def test_roundtrip_single_object_info():
     assert obj.header.ink_effect_param == 0x1234
     assert obj.name == "Freddy"
     assert obj.properties_raw == b"\xde\xad\xbe\xef"
+    assert obj.properties is None
     assert obj.effects_raw == b""
     # by_handle resolves the template
     assert fi.by_handle[42] is obj
@@ -250,7 +270,11 @@ def test_roundtrip_multiple_object_infos_preserve_order():
     payload = _pack_payload(
         [_pack_object_info(h, t, name=n) for h, t, n in specs]
     )
-    fi = decode_frame_items(payload, unicode=True)
+    fi = decode_frame_items(
+        payload,
+        unicode=True,
+        decode_active_properties=False,
+    )
     assert fi.count == 3
     assert [it.handle for it in fi.items] == [0, 1, 2]
     assert [it.object_type for it in fi.items] == [
@@ -300,7 +324,7 @@ def test_ink_effect_antialias_bit():
     payload = _pack_payload(
         [_pack_object_info(handle=0, object_type=2, ink_effect=ink)]
     )
-    obj = decode_frame_items(payload).items[0]
+    obj = decode_frame_items(payload, decode_active_properties=False).items[0]
     assert obj.header.antialias is True
     assert obj.header.transparent is True
     assert obj.header.ink_effect_id == 0xA
@@ -311,7 +335,7 @@ def test_as_dict_shape():
     payload = _pack_payload(
         [_pack_object_info(handle=1, object_type=2, name="X")]
     )
-    d = decode_frame_items(payload).as_dict()
+    d = decode_frame_items(payload, decode_active_properties=False).as_dict()
     assert d["count"] == 1
     assert d["deferred_encrypted"] == []
     assert d["deferred_sub_chunk_ids_seen"] == ["0x4446"]
@@ -322,6 +346,8 @@ def test_as_dict_shape():
     assert item["header"]["handle"] == 1
     assert item["header"]["object_type_name"] == "Active"
     assert item["properties_len"] == 4
+    assert item["properties_decoded"] is False
+    assert item["properties"] is None
     assert item["effects_len"] == 0
 
 
@@ -437,7 +463,7 @@ def test_duplicate_handle_raises():
         ]
     )
     with pytest.raises(FrameItemsDecodeError, match="duplicate handle 7"):
-        decode_frame_items(payload)
+        decode_frame_items(payload, decode_active_properties=False)
 
 
 def test_inner_sub_chunk_size_overrun_raises():
@@ -456,7 +482,7 @@ def test_trailing_junk_after_last_object_info_raises():
     block = _pack_object_info(handle=0, object_type=2)
     payload = _pack_payload([block]) + b"\xAA\xBB\xCC"
     with pytest.raises(FrameItemsDecodeError, match="unconsumed"):
-        decode_frame_items(payload)
+        decode_frame_items(payload, decode_active_properties=False)
 
 
 # --- FNAF 1 multi-input (Antibody #5 / #7) ------------------------------
@@ -556,6 +582,80 @@ def test_fnaf1_frame_items_snapshot():
     for item in fi.items:
         assert isinstance(item.header, ObjectHeader)
         assert item.name is not None and item.name != ""
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")
+def test_fnaf1_active_object_common_snapshot(fnaf1_image_bank):
+    """Antibody #8: Active 0x4446 bodies decode as ObjectCommon.
+
+    Pins the new structured scope:
+
+    - all 124 Active objects decode, while non-Active objects stay raw
+    - ObjectCommon header.size lines up with the raw property byte length
+    - the only unconsumed coverage gap is the known [62..70) zero pad
+    - animation-table counts match the probe inventory
+    - every animation image handle resolves into the sparse ImageBank
+      handle set (not `handle < image_count`)
+    """
+    blob, result, transform = _fnaf1_transform_and_records()
+    fi_rec = next(r for r in result.records if r.id == 0x2229)
+    payload = read_chunk_payload(blob, fi_rec, transform=transform)
+    fi = decode_frame_items(
+        payload, unicode=result.header.unicode, transform=transform
+    )
+
+    active = [item for item in fi.items if item.object_type == OBJECT_TYPE_ACTIVE]
+    non_active = [item for item in fi.items if item.object_type != OBJECT_TYPE_ACTIVE]
+    assert len(active) == FNAF1_ACTIVE_COUNT
+    assert all(item.properties is not None for item in active)
+    assert all(item.properties is None for item in non_active)
+    assert sum(len(item.properties_raw) for item in active) == (
+        FNAF1_ACTIVE_TOTAL_PROPERTIES_BYTES
+    )
+
+    total_frames = 0
+    total_directions = 0
+    all_animation_handles: set[int] = set()
+    for item in active:
+        props = item.properties
+        assert props is not None
+        assert props.header.identifier == "SPRI"
+        assert props.header.size == len(item.properties_raw)
+        assert len(props.coverage_gaps) == 1
+        gap = props.coverage_gaps[0]
+        assert gap.start == KNOWN_ZERO_PAD_START
+        assert gap.end == KNOWN_ZERO_PAD_END
+        assert gap.data == KNOWN_ZERO_PAD_BYTES
+        assert gap.is_known_zero_pad is True
+        assert (
+            sum(span.size for span in props.coverage_spans)
+            + sum(g.size for g in props.coverage_gaps)
+        ) == len(item.properties_raw)
+
+        assert props.animations is not None
+        total_frames += props.animations.total_frames
+        total_directions += props.animations.total_directions
+        all_animation_handles.update(props.image_handles)
+
+    assert total_frames == FNAF1_ACTIVE_ANIMATION_FRAMES
+    assert total_directions == FNAF1_ACTIVE_ANIMATION_DIRECTIONS
+    assert len(all_animation_handles) == FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES
+
+    assert fnaf1_image_bank.count == 605
+    missing_image_handles = sorted(all_animation_handles - fnaf1_image_bank.handles)
+    assert missing_image_handles == []
+    # Sparse-handle antibody: this must remain membership-in-bank, not
+    # handle < image_count. FNAF 1 has valid animation handles above 605.
+    assert max(all_animation_handles) > fnaf1_image_bank.count
+
+    largest = max(active, key=lambda item: len(item.properties_raw))
+    assert largest.handle == 44
+    assert largest.name == "Active 3"
+    assert len(largest.properties_raw) == 5304
+    assert largest.properties is not None
+    assert largest.properties.animations is not None
+    assert largest.properties.animations.count == 76
+    assert largest.properties.animations.total_frames == 176
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF1 binary not available")

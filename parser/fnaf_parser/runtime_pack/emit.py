@@ -31,11 +31,9 @@ refuses to proceed if they are missing.
 Scope cuts
 ----------
 
-- Does NOT decode ObjectCommon (the opaque ``properties_raw`` bytes on
-  each FrameItems entry). Animation tables, alterable defaults,
-  hotspots, and default movement live in those bytes. A future probe
-  + decoder unlocks files 2 (animation tables) and 3 (per-object
-  properties); see Runtime Pack Extraction node on the SiftText tree.
+- Decodes Active ObjectCommon animation tables into
+  ``runtime_pack/object_bank/objects.json``. Movements and non-Active
+  property bodies remain explicit raw/opaque scope cuts.
 - Does NOT re-run the algorithm or asset emit — those are independent
   subcommands. The runtime pack is purely additive.
 """
@@ -50,9 +48,17 @@ from typing import Any
 
 from fnaf_parser.compression import read_chunk_payload
 from fnaf_parser.decoders.frame import decode_frame
+from fnaf_parser.decoders.frame_items import (
+    OBJECT_TYPE_ACTIVE,
+    decode_frame_items,
+    object_type_name,
+)
 from fnaf_parser.pipeline import load_pack
 
 # --- Constants ----------------------------------------------------------
+
+#: 0x2229 FrameItems chunk id: pack-level ObjectInfo/template bank.
+_CHUNK_ID_FRAME_ITEMS = 0x2229
 
 #: 0x3333 Frame chunk id. Defined locally so ``grep 0x3333`` finds every
 #: user and the module is self-contained w.r.t. the outer chunk walker.
@@ -142,6 +148,103 @@ def _frame_to_scene_start_dict(frame: Any, *, frame_index: int) -> dict[str, Any
     }
 
 
+# --- Object-bank serialization ----------------------------------------
+
+
+def _animation_to_runtime_dict(animation: Any) -> dict[str, Any]:
+    """Serialize one decoded ObjectCommon animation for Rust.
+
+    The top-level ``image_handles`` field is the flattened list across
+    loaded directions (FNAF 1 only stores direction 0, but the schema is
+    direction-ready). Each direction carries its own speed/repeat/back-to
+    metadata so the runtime does not need to reinterpret the raw parser
+    shape.
+    """
+    directions = [direction.as_dict() for direction in animation.directions]
+    return {
+        "animation_index": animation.animation_index,
+        "animation_name": animation.animation_name,
+        "image_handles": list(animation.image_handles),
+        "directions": directions,
+    }
+
+
+def _object_info_to_runtime_dict(obj: Any) -> dict[str, Any]:
+    """Serialize one ObjectInfo for the runtime object bank."""
+    decoded = obj.properties is not None
+    animations = None
+    properties_summary = None
+    if decoded:
+        properties_summary = obj.properties.summary
+        if obj.properties.animations is not None:
+            animations = {
+                "summary": obj.properties.animations.summary_dict(),
+                "items": [
+                    _animation_to_runtime_dict(animation)
+                    for animation in obj.properties.animations.animations
+                    if animation.directions
+                ],
+            }
+
+    return {
+        "handle": obj.handle,
+        "name": obj.name,
+        "object_type": obj.object_type,
+        "object_type_name": object_type_name(obj.object_type),
+        "header": obj.header.as_dict(),
+        "properties_len": len(obj.properties_raw),
+        "properties_decoded": decoded,
+        "properties_summary": properties_summary,
+        "effects_len": len(obj.effects_raw),
+        "animations": animations,
+    }
+
+
+def _frame_items_to_object_bank_dict(frame_items: Any) -> dict[str, Any]:
+    """Serialize the pack-level ObjectInfo bank.
+
+    Active objects carry decoded ObjectCommon animation tables. Other
+    object types intentionally remain raw in V0 (``properties_decoded``
+    false) so downstream code can distinguish "not present" from
+    "present but deferred by scope".
+    """
+    objects = [_object_info_to_runtime_dict(obj) for obj in frame_items.items]
+    active_objects = [
+        obj for obj in frame_items.items if obj.object_type == OBJECT_TYPE_ACTIVE
+    ]
+    active_decoded = [obj for obj in active_objects if obj.properties is not None]
+    total_active_frames = sum(
+        obj.properties.animations.total_frames
+        for obj in active_decoded
+        if obj.properties is not None and obj.properties.animations is not None
+    )
+    total_active_directions = sum(
+        obj.properties.animations.total_directions
+        for obj in active_decoded
+        if obj.properties is not None and obj.properties.animations is not None
+    )
+    unique_active_image_handles = sorted(
+        {
+            handle
+            for obj in active_decoded
+            if obj.properties is not None
+            for handle in obj.properties.image_handles
+        }
+    )
+    return {
+        "count": frame_items.count,
+        "active_count": len(active_objects),
+        "active_decoded_count": len(active_decoded),
+        "active_animation_frames": total_active_frames,
+        "active_animation_directions": total_active_directions,
+        "active_unique_image_handles": unique_active_image_handles,
+        "deferred_sub_chunk_ids_seen": sorted(
+            f"0x{cid:04X}" for cid in frame_items.deferred_sub_chunk_ids_seen
+        ),
+        "objects": objects,
+    }
+
+
 # --- Writers -----------------------------------------------------------
 
 
@@ -178,6 +281,7 @@ _MANIFEST_SUBDIRS: tuple[str, ...] = (
     "audio",
     "images",
     "runtime_pack/frames_state",
+    "runtime_pack/object_bank",
 )
 
 
@@ -226,6 +330,7 @@ def _build_master_manifest(
     source_sha256: str,
     out_dir: Path,
     per_frame_summaries: list[dict[str, Any]],
+    object_bank_summary: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the master manifest dict.
 
@@ -264,6 +369,16 @@ def _build_master_manifest(
             "total_instances": total_instances,
             "total_layers": total_layers,
             "per_frame_instance_counts": per_frame_instance_counts,
+            "objects": object_bank_summary["count"],
+            "active_objects": object_bank_summary["active_count"],
+            "active_decoded_objects": object_bank_summary["active_decoded_count"],
+            "active_animation_frames": object_bank_summary["active_animation_frames"],
+            "active_animation_directions": object_bank_summary[
+                "active_animation_directions"
+            ],
+            "active_unique_image_handles": len(
+                object_bank_summary["active_unique_image_handles"]
+            ),
         },
     }
 
@@ -309,11 +424,26 @@ def dump_runtime_pack(exe: Path, out_dir: Path) -> list[Path]:
 
     runtime_pack_dir = out_dir / "runtime_pack"
     frames_state_dir = runtime_pack_dir / "frames_state"
+    object_bank_dir = runtime_pack_dir / "object_bank"
     runtime_pack_dir.mkdir(parents=True, exist_ok=True)
     frames_state_dir.mkdir(parents=True, exist_ok=True)
+    object_bank_dir.mkdir(parents=True, exist_ok=True)
 
     per_frame_summaries: list[dict[str, Any]] = []
     written: list[Path] = []
+
+    frame_items_rec = next(
+        r for r in pack.walk.records if r.id == _CHUNK_ID_FRAME_ITEMS
+    )
+    frame_items = decode_frame_items(
+        read_chunk_payload(pack.blob, frame_items_rec, transform=pack.transform),
+        unicode=unicode,
+        transform=pack.transform,
+    )
+    object_bank = _frame_items_to_object_bank_dict(frame_items)
+    object_bank_path = object_bank_dir / "objects.json"
+    _write_json(object_bank_path, object_bank)
+    written.append(object_bank_path)
 
     for frame_index, frame_rec in enumerate(frame_records):
         frame_payload = read_chunk_payload(
@@ -349,6 +479,7 @@ def dump_runtime_pack(exe: Path, out_dir: Path) -> list[Path]:
         source_sha256=source_sha256,
         out_dir=out_dir,
         per_frame_summaries=per_frame_summaries,
+        object_bank_summary=object_bank,
     )
     manifest_path = runtime_pack_dir / "manifest.json"
     _write_json(manifest_path, manifest)

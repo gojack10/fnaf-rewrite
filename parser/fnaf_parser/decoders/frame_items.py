@@ -97,6 +97,11 @@ from dataclasses import dataclass, field
 
 from fnaf_parser.chunk_ids import CHUNK_NAMES, LAST_CHUNK_ID
 from fnaf_parser.compression import ChunkFlag, decompress_payload_bytes
+from fnaf_parser.decoders.object_common import (
+    ObjectCommon,
+    ObjectCommonDecodeError,
+    decode_object_common,
+)
 from fnaf_parser.decoders.strings import decode_string_chunk
 from fnaf_parser.encryption import TransformState
 
@@ -287,16 +292,20 @@ class ObjectInfo:
 
     At this probe scope, `header` and `name` are always populated (missing
     0x4444 raises; missing 0x4445 is allowed and leaves `name=None`).
-    `properties_raw` and `effects_raw` hold the opaque post-decompression
-    bytes of 0x4446 and 0x4448 respectively — empty `b""` when the sub-
-    chunk was absent (so round-trip can distinguish absent-vs-empty via
-    `sub_records`).
+    `properties_raw` and `effects_raw` hold the post-decompression bytes
+    of 0x4446 and 0x4448 respectively — empty `b""` when the sub-chunk
+    was absent (so round-trip can distinguish absent-vs-empty via
+    `sub_records`). For Active objects, `properties` carries the decoded
+    ObjectCommon body when `decode_frame_items(..., decode_active_properties=True)`
+    is used. Other object types stay raw until their body shapes are
+    probed separately.
     """
     header: ObjectHeader
     name: str | None
     properties_raw: bytes = field(repr=False)
     effects_raw: bytes = field(repr=False)
     sub_records: tuple[ObjectInfoSubChunkRecord, ...]
+    properties: ObjectCommon | None = field(default=None, repr=False)
 
     @property
     def handle(self) -> int:
@@ -311,6 +320,10 @@ class ObjectInfo:
             "header": self.header.as_dict(),
             "name": self.name,
             "properties_len": len(self.properties_raw),
+            "properties_decoded": self.properties is not None,
+            "properties": (
+                self.properties.as_dict() if self.properties is not None else None
+            ),
             "effects_len": len(self.effects_raw),
             "sub_chunks": [
                 {
@@ -516,6 +529,7 @@ def _decode_one_object_info(
     transform: TransformState | None,
     deferred_sub_chunk_ids_seen: set[int],
     deferred_encrypted: list[ObjectInfoSubChunkRecord],
+    decode_active_properties: bool,
 ) -> tuple[ObjectInfo, int]:
     """Decode one ObjectInfo starting at `start` in the outer payload.
 
@@ -575,6 +589,22 @@ def _decode_one_object_info(
             f"Header. Antibody #1 strict-unknown."
         )
 
+    properties: ObjectCommon | None = None
+    if (
+        decode_active_properties
+        and header.object_type == OBJECT_TYPE_ACTIVE
+        and properties_raw
+    ):
+        try:
+            properties = decode_object_common(properties_raw)
+        except ObjectCommonDecodeError as exc:
+            raise FrameItemsDecodeError(
+                f"0x2229 FrameItems: Active ObjectInfo handle={header.handle} "
+                f"name={name!r} has malformed ObjectCommon properties "
+                f"({len(properties_raw)} bytes) at ObjectInfo payload "
+                f"offset 0x{start:x}: {exc}"
+            ) from exc
+
     return (
         ObjectInfo(
             header=header,
@@ -582,6 +612,7 @@ def _decode_one_object_info(
             properties_raw=properties_raw,
             effects_raw=effects_raw,
             sub_records=sub_records,
+            properties=properties,
         ),
         end,
     )
@@ -592,6 +623,7 @@ def decode_frame_items(
     *,
     unicode: bool = True,
     transform: TransformState | None = None,
+    decode_active_properties: bool = True,
 ) -> FrameItems:
     """Decode a 0x2229 FrameItems chunk's plaintext bytes.
 
@@ -603,6 +635,11 @@ def decode_frame_items(
     gated; in FNAF 1 this is `True`). `transform` is threaded through
     to inner sub-chunk decompression in case any inner chunk is
     flag=2/3 encrypted.
+
+    When `decode_active_properties` is true (the default), Active
+    ObjectInfo 0x4446 bodies are decoded through `object_common.py` and
+    exposed as `ObjectInfo.properties`. Non-Active properties stay in
+    `properties_raw` only.
 
     Antibodies enforced:
 
@@ -651,6 +688,7 @@ def decode_frame_items(
             transform=transform,
             deferred_sub_chunk_ids_seen=deferred_sub_chunk_ids_seen,
             deferred_encrypted=deferred_encrypted,
+            decode_active_properties=decode_active_properties,
         )
 
         existing_idx = seen_handles.get(obj.handle)

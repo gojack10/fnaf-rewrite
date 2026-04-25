@@ -1,4 +1,4 @@
-"""Runtime-Pack Emit Antibody — V0 scene-start + master manifest pin.
+"""Runtime-Pack Emit Antibody — V0 scene-start + object-bank manifest pin.
 
 Pins the structural invariants the runtime-pack emit must keep holding
 across refactors. Mirrors ``test_algorithm_snapshot.py``'s shape: one
@@ -12,18 +12,24 @@ Pinned facts (see SiftText ``Runtime Pack Extraction`` node,
    SHA-256 verifies; every size_bytes matches disk size.
 2. `runtime_pack/frames_state/` contains exactly 17 files (one per
    0x3333 Frame chunk).
-3. Every item_instance.object_info in every frame_state file resolves
+3. `runtime_pack/object_bank/objects.json` exists and carries 196
+   ObjectInfos, including 124 decoded Active ObjectCommon animation
+   tables.
+4. Every emitted animation image handle resolves to an emitted PNG using
+   sparse handle membership (not `handle < image_count`).
+5. Every item_instance.object_info in every frame_state file resolves
    to a handle in the pack-level FrameItems bank (196 handles).
-4. Every item_instance.layer in every frame_state file is within the
+6. Every item_instance.layer in every frame_state file is within the
    valid layer range for that frame.
-5. Manifest `source_sha256` matches the `.exe` bytes it read.
-6. Manifest does NOT self-reference (writing last means the digest
+7. Manifest `source_sha256` matches the `.exe` bytes it read.
+8. Manifest does NOT self-reference (writing last means the digest
    would otherwise be undefined).
-7. Manifest `counts` section is self-consistent: counts.frames matches
+9. Manifest `counts` section is self-consistent: counts.frames matches
    the number of frame_state files, counts.images matches `*.png`
-   count in files, counts.audio matches `*.wav` count.
-8. Pre-requisite check: calling `dump_runtime_pack` without prior
-   `dump-algorithm` + `dump-assets` raises `RuntimePackEmitError`.
+   count in files, counts.audio matches `*.wav` count, and object-bank
+   counts match objects.json.
+10. Pre-requisite check: calling `dump_runtime_pack` without prior
+    `dump-algorithm` + `dump-assets` raises `RuntimePackEmitError`.
 """
 
 from __future__ import annotations
@@ -56,6 +62,10 @@ FNAF_EXE = Path(__file__).resolve().parent.parent.parent / "FiveNightsatFreddys.
 
 FNAF1_FRAME_COUNT = 17
 FNAF1_FRAME_ITEMS_HANDLES = 196
+FNAF1_ACTIVE_COUNT = 124
+FNAF1_ACTIVE_ANIMATION_FRAMES = 511
+FNAF1_ACTIVE_ANIMATION_DIRECTIONS = 234
+FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES = 389
 FNAF1_IMAGE_COUNT = 605
 FNAF1_AUDIO_COUNT = 52
 
@@ -103,6 +113,13 @@ def _pack_out(tmp_path_factory: pytest.TempPathFactory) -> Path:
     dump_runtime_pack(FNAF_EXE, out)
 
     return out
+
+
+def _load_object_bank(pack_out: Path) -> dict:
+    """Read runtime_pack/object_bank/objects.json from a shared emit."""
+    return json.loads(
+        (pack_out / "runtime_pack" / "object_bank" / "objects.json").read_text()
+    )
 
 
 # --- Antibodies ---------------------------------------------------------
@@ -190,6 +207,16 @@ def test_antibody_counts_are_self_consistent(_pack_out: Path) -> None:
     assert counts["frames"] == FNAF1_FRAME_COUNT
     assert counts["images"] == FNAF1_IMAGE_COUNT
     assert counts["audio"] == FNAF1_AUDIO_COUNT
+    assert counts["objects"] == FNAF1_FRAME_ITEMS_HANDLES
+    assert counts["active_objects"] == FNAF1_ACTIVE_COUNT
+    assert counts["active_decoded_objects"] == FNAF1_ACTIVE_COUNT
+    assert counts["active_animation_frames"] == FNAF1_ACTIVE_ANIMATION_FRAMES
+    assert counts["active_animation_directions"] == (
+        FNAF1_ACTIVE_ANIMATION_DIRECTIONS
+    )
+    assert counts["active_unique_image_handles"] == (
+        FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES
+    )
 
     # Cross-check counts against the files list
     png_count = sum(1 for k in files if k.endswith(".png"))
@@ -197,9 +224,76 @@ def test_antibody_counts_are_self_consistent(_pack_out: Path) -> None:
     frame_state_count = sum(
         1 for k in files if k.startswith("runtime_pack/frames_state/")
     )
+    object_bank_count = sum(
+        1 for k in files if k.startswith("runtime_pack/object_bank/")
+    )
     assert png_count == counts["images"]
     assert wav_count == counts["audio"]
     assert frame_state_count == counts["frames"]
+    assert object_bank_count == 1
+    assert "runtime_pack/object_bank/objects.json" in files
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF 1 binary not on disk")
+def test_antibody_object_bank_active_animations_emitted(_pack_out: Path) -> None:
+    """The runtime pack must include the decoded Active animation table."""
+    object_bank_path = _pack_out / "runtime_pack" / "object_bank" / "objects.json"
+    assert object_bank_path.is_file()
+    object_bank = _load_object_bank(_pack_out)
+
+    assert object_bank["count"] == FNAF1_FRAME_ITEMS_HANDLES
+    assert len(object_bank["objects"]) == FNAF1_FRAME_ITEMS_HANDLES
+    assert object_bank["active_count"] == FNAF1_ACTIVE_COUNT
+    assert object_bank["active_decoded_count"] == FNAF1_ACTIVE_COUNT
+    assert object_bank["active_animation_frames"] == (
+        FNAF1_ACTIVE_ANIMATION_FRAMES
+    )
+    assert object_bank["active_animation_directions"] == (
+        FNAF1_ACTIVE_ANIMATION_DIRECTIONS
+    )
+    assert len(object_bank["active_unique_image_handles"]) == (
+        FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES
+    )
+
+    active = [
+        obj for obj in object_bank["objects"] if obj["object_type_name"] == "Active"
+    ]
+    non_active = [
+        obj for obj in object_bank["objects"] if obj["object_type_name"] != "Active"
+    ]
+    assert len(active) == FNAF1_ACTIVE_COUNT
+    assert all(obj["properties_decoded"] is True for obj in active)
+    assert all(obj["animations"] is not None for obj in active)
+    assert all(obj["properties_decoded"] is False for obj in non_active)
+    assert all(obj["animations"] is None for obj in non_active)
+
+    largest = next(obj for obj in object_bank["objects"] if obj["handle"] == 44)
+    assert largest["name"] == "Active 3"
+    assert largest["properties_len"] == 5304
+    assert largest["animations"]["summary"]["total_animations"] == 76
+    assert largest["animations"]["summary"]["total_frames"] == 176
+
+
+@pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF 1 binary not on disk")
+def test_antibody_object_bank_animation_handles_resolve_to_pngs(
+    _pack_out: Path,
+) -> None:
+    """Every emitted animation image handle must map to an emitted PNG.
+
+    This intentionally checks sparse handle membership. FNAF 1 has 605
+    image records but valid handles above 605, so `handle < count` is the
+    wrong oracle.
+    """
+    object_bank = _load_object_bank(_pack_out)
+    handles = set(object_bank["active_unique_image_handles"])
+    assert len(handles) == FNAF1_ACTIVE_UNIQUE_IMAGE_HANDLES
+    assert max(handles) > FNAF1_IMAGE_COUNT
+
+    images_dir = _pack_out / "images"
+    missing = sorted(
+        handle for handle in handles if not (images_dir / f"{handle:04d}.png").is_file()
+    )
+    assert missing == []
 
 
 @pytest.mark.skipif(not FNAF_EXE.exists(), reason="FNAF 1 binary not on disk")
