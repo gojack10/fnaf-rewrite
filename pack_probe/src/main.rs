@@ -9,7 +9,8 @@
 //                - Counter  (44):  CounterPropertiesSummary (display_style + handles),
 //                - Backdrop (15):  BackdropPropertiesSummary (obstacle/collision
 //                                  + width/height + image_handle),
-//                - non-(Active|Counter|Backdrop) (13): assert "no decode yet"
+//                - Text     (10):  TextPropertiesSummary (Paragraph + box dims),
+//                - non-(Active|Counter|Backdrop|Text) (3): assert "no decode yet"
 //                                  null pattern.
 //          Catalog every failure as a probe target back on the parser side.
 //
@@ -70,6 +71,9 @@ fn phase_a_untyped(manifest_path: &Path, objects_path: &Path) -> Result<()> {
         "counter_total_handle_refs",
         "backdrop_count",
         "backdrop_decoded_count",
+        "text_count",
+        "text_decoded_count",
+        "text_total_chars",
         "count",
     ] {
         if let Some(v) = objects_doc.get(key) {
@@ -172,6 +176,10 @@ struct ObjectsFile {
     backdrop_count: u32,
     backdrop_decoded_count: u32,
     backdrop_unique_image_handles: Vec<u32>,
+    text_count: u32,
+    text_decoded_count: u32,
+    text_total_chars: u32,
+    text_unique_font_handles: Vec<u32>,
     count: u32,
     #[serde(default)]
     deferred_sub_chunk_ids_seen: Vec<String>,
@@ -316,6 +324,33 @@ struct BackdropPropertiesSummary {
     image_handle: u32,
 }
 
+// ---- Text-specific inner shape ----
+//
+// FNAF 1 Text property body is a 116-byte ObjectCommon-shaped wrapper plus
+// an inner Text struct (size + box_width + box_height + paragraph_count +
+// paragraph_offsets + Paragraph). FNAF 1 always emits paragraph_count=1, so
+// the per-object `properties_summary` flattens that single Paragraph into
+// the same dict — font_handle, flags (u16 bitfield), human-readable
+// flag_names, color (always 0x00FFFFFF white), and the decoded value
+// string + char_count. Box dims and inner_size are kept for round-trip /
+// renderer downstream.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // schema-receiver: fields exist to assert shape, not be read
+#[serde(deny_unknown_fields)]
+struct TextPropertiesSummary {
+    size: u32,
+    inner_size: u32,
+    box_width: u32,
+    box_height: u32,
+    paragraph_count: u32,
+    font_handle: u32,
+    flags: u32,
+    flag_names: Vec<String>,
+    color: u32,
+    char_count: u32,
+    value: String,
+}
+
 fn phase_b_typed(objects_path: &Path) -> Result<()> {
     println!("--- Phase B: typed deserialization ---");
 
@@ -404,6 +439,11 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
 
     // Accumulate Backdrop-side stats once typed deserialization succeeds.
     let mut walked_backdrop_unique_handles: BTreeSet<u32> = BTreeSet::new();
+
+    // Accumulate Text-side stats once typed deserialization succeeds.
+    let mut walked_text_total_chars = 0_u32;
+    let mut walked_text_unique_font_handles: BTreeSet<u32> = BTreeSet::new();
+    let mut text_typed_ok = 0_u32;
 
     for raw in &objects.objects {
         // (1) envelope
@@ -670,8 +710,109 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                 walked_backdrop_unique_handles.insert(summary.image_handle);
                 backdrop_typed_ok += 1;
             }
+            3 => {
+                // Text — typed inner expected (decoder shipped 2026-04-25).
+                // animations must be null (Text has no animation table);
+                // properties_summary must typed-deserialize as
+                // TextPropertiesSummary.
+                if !envelope.properties_decoded {
+                    failures.push(format!(
+                        "Text handle={} name={:?} has properties_decoded=false (expected true)",
+                        envelope.handle, envelope.name,
+                    ));
+                    continue;
+                }
+                if envelope.animations.is_some() {
+                    failures.push(format!(
+                        "Text handle={} name={:?} has animations present (expected null)",
+                        envelope.handle, envelope.name,
+                    ));
+                }
+                let summary_v = match envelope.properties_summary.as_ref() {
+                    Some(v) => v,
+                    None => {
+                        failures.push(format!(
+                            "Text handle={} name={:?} has properties_summary=null",
+                            envelope.handle, envelope.name,
+                        ));
+                        continue;
+                    }
+                };
+                let summary: TextPropertiesSummary =
+                    match serde_json::from_value(summary_v.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            failures.push(format!(
+                                "Text handle={} name={:?} properties_summary typed deser failed: {e}",
+                                envelope.handle, envelope.name,
+                            ));
+                            continue;
+                        }
+                    };
+
+                // FNAF 1 contract tripwires (per Non-Active Body Decoders
+                // crystallization, 2026-04-25 ship-log):
+                //
+                // * paragraph_count is always 1. A higher count means a
+                //   future game shipped multi-paragraph Text — surfacing
+                //   here is load-bearing because the renderer / parser
+                //   currently flattens to a single Paragraph.
+                // * color is always 0x00FFFFFF (white). A non-white text
+                //   would mean the color decoder swap is silently wrong
+                //   on a real FNAF panel sprite.
+                // * size mirror sanity: body_size = 146 + 2 * char_count
+                //   (144-byte fixed prefix + UTF-16 chars + 2-byte NUL).
+                if summary.paragraph_count != 1 {
+                    failures.push(format!(
+                        "Text handle={} name={:?} unexpected paragraph_count={} \
+                         (FNAF 1 should be 1; multi-paragraph not supported)",
+                        envelope.handle, envelope.name, summary.paragraph_count,
+                    ));
+                }
+                if summary.color != 0x00FF_FFFF {
+                    failures.push(format!(
+                        "Text handle={} name={:?} unexpected color=0x{:08X} \
+                         (FNAF 1 should be 0x00FFFFFF white)",
+                        envelope.handle, envelope.name, summary.color,
+                    ));
+                }
+                let expected_size = 146 + 2 * summary.char_count;
+                if summary.size != expected_size {
+                    failures.push(format!(
+                        "Text handle={} name={:?} size={} != 146 + 2*char_count({}) = {}",
+                        envelope.handle,
+                        envelope.name,
+                        summary.size,
+                        summary.char_count,
+                        expected_size,
+                    ));
+                }
+                if summary.inner_size != summary.size - 116 {
+                    failures.push(format!(
+                        "Text handle={} name={:?} inner_size={} != size-116={}",
+                        envelope.handle,
+                        envelope.name,
+                        summary.inner_size,
+                        summary.size - 116,
+                    ));
+                }
+                // value <-> char_count consistency (UTF-16 codepoint count).
+                if summary.value.chars().count() as u32 != summary.char_count {
+                    failures.push(format!(
+                        "Text handle={} name={:?} value.chars()={} != char_count={}",
+                        envelope.handle,
+                        envelope.name,
+                        summary.value.chars().count(),
+                        summary.char_count,
+                    ));
+                }
+
+                walked_text_total_chars += summary.char_count;
+                walked_text_unique_font_handles.insert(summary.font_handle);
+                text_typed_ok += 1;
+            }
             _ => {
-                // Non-(Active|Counter|Backdrop) — no decoder shipped yet.
+                // Non-(Active|Counter|Backdrop|Text) — no decoder shipped yet.
                 // Assert the null pattern.
                 let mut pattern_failures = Vec::new();
                 if envelope.properties_decoded {
@@ -687,9 +828,9 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
                     nonactive_null_ok += 1;
                 } else {
                     // This is the GOOD trigger — when parser ships decoders for
-                    // Text/Extension, this fires. Re-flag as "type new structs."
+                    // Extension, this fires. Re-flag as "type new structs."
                     failures.push(format!(
-                        "non-(Active|Counter|Backdrop) type={} ({}) handle={} name={:?} broke null-pattern: {} \
+                        "non-(Active|Counter|Backdrop|Text) type={} ({}) handle={} name={:?} broke null-pattern: {} \
                          — TIME TO ADD TYPED STRUCTS FOR THIS TYPE",
                         envelope.object_type,
                         envelope.object_type_name,
@@ -745,13 +886,29 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
             backdrop_typed_ok, objects.backdrop_count,
         ));
     }
+    if objects.text_count != 10 {
+        failures.push(format!("text_count={} expected 10", objects.text_count));
+    }
+    if objects.text_decoded_count != objects.text_count {
+        failures.push(format!(
+            "text_decoded_count={} != text_count={}",
+            objects.text_decoded_count, objects.text_count,
+        ));
+    }
+    if text_typed_ok != objects.text_count {
+        failures.push(format!(
+            "Text typed-pass parsed {} of {} texts",
+            text_typed_ok, objects.text_count,
+        ));
+    }
     let nonactive_total = objects.count
         - objects.active_count
         - objects.counter_count
-        - objects.backdrop_count;
+        - objects.backdrop_count
+        - objects.text_count;
     if nonactive_null_ok != nonactive_total {
         failures.push(format!(
-            "non-(Active|Counter|Backdrop) null-pattern matched {} of {} remaining",
+            "non-(Active|Counter|Backdrop|Text) null-pattern matched {} of {} remaining",
             nonactive_null_ok, nonactive_total,
         ));
     }
@@ -843,11 +1000,45 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         ));
     }
 
+    // Text rollup cross-checks. text_total_chars sums the per-Paragraph
+    // char_count over all 10 Texts; text_unique_font_handles is the
+    // deduped set of fonts referenced by any Text. Both are header
+    // aggregates emitted by the parser at runtime-pack time.
+    if walked_text_total_chars != objects.text_total_chars {
+        failures.push(format!(
+            "walked Text total chars={} != header text_total_chars={}",
+            walked_text_total_chars, objects.text_total_chars,
+        ));
+    }
+    let header_text_fonts: BTreeSet<u32> = objects
+        .text_unique_font_handles
+        .iter()
+        .copied()
+        .collect();
+    if walked_text_unique_font_handles != header_text_fonts {
+        let only_walked: Vec<u32> = walked_text_unique_font_handles
+            .difference(&header_text_fonts)
+            .copied()
+            .collect();
+        let only_header: Vec<u32> = header_text_fonts
+            .difference(&walked_text_unique_font_handles)
+            .copied()
+            .collect();
+        failures.push(format!(
+            "walked Text unique font handles ({}) != header text_unique_font_handles ({}). \
+             only-walked={:?} only-header={:?}",
+            walked_text_unique_font_handles.len(),
+            header_text_fonts.len(),
+            only_walked,
+            only_header,
+        ));
+    }
+
     // Surface the deferred-chunk antibody signal.
     if !objects.deferred_sub_chunk_ids_seen.is_empty() {
         println!(
             "[deferred] sub_chunk_ids_seen = {:?} (signal: parser left these undecoded — \
-             will drop to [] when Backdrop/Text/Extension body decoders ship)",
+             will drop to [] when Extension body decoders ship)",
             objects.deferred_sub_chunk_ids_seen,
         );
     }
@@ -867,7 +1058,11 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
         objects.backdrop_count,
     );
     println!(
-        "[typed pass] non-(Active|Counter|Backdrop) OK  : {nonactive_null_ok} / {nonactive_total}",
+        "[typed pass] Text inner OK                     : {text_typed_ok} / {}",
+        objects.text_count,
+    );
+    println!(
+        "[typed pass] non-(Active|Counter|Backdrop|Text) OK  : {nonactive_null_ok} / {nonactive_total}",
     );
     println!(
         "[Active rollup]   max_anim_items={} total_directions={} total_frames={} \
@@ -885,6 +1080,11 @@ fn phase_b_typed(objects_path: &Path) -> Result<()> {
     println!(
         "[Backdrop rollup] unique_handles={}",
         walked_backdrop_unique_handles.len(),
+    );
+    println!(
+        "[Text rollup]     total_chars={} unique_font_handles={}",
+        walked_text_total_chars,
+        walked_text_unique_font_handles.len(),
     );
 
     println!();
